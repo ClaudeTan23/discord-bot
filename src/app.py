@@ -13,10 +13,6 @@ intents.message_content = True
 
 bot = commands.Bot(command_prefix='?', intents=intents)
 
-# @bot.event 
-# async def on_message(ctx):
-#     print(join.JoinChannel(bot).v_channels_connected)
-
 @bot.event
 async def on_ready():
     await bot.change_presence(status=Status.idle, activity=Game("Testing"))
@@ -27,8 +23,3 @@ async def on_ready():
     print(f"{bot.user} online")
 
 bot.run(botToken)
-
-
-
-
-# bot.add_command(test)
