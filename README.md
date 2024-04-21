@@ -1,4 +1,4 @@
-Discord bot prototype
+Discord bot
 
 implementation features (In progress)
 1. music player
