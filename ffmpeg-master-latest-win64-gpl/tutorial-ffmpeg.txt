@@ -1,0 +1,1 @@
+FFMPEG bin folder here, the bin folder that contains ffmpeg.exe
