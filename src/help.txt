@@ -1,0 +1,16 @@
+- **`?add`** ***"Youtube url/link"***  support youtube playlist as well 
+- **`?join`** ***"Voice channel ID"***  join the voice channel 
+- **`?leave`**  Leave the joined voice channel 
+- **`?play`**  Play the songs/musics in the voice channel
+- **`?pause`**  Pause the playing song in the voice channel
+- **`?resume`**  Resuming the paused song in the voice channel
+- **`?skip`**  Skip to the next song/music
+- **`?skipto`** ***"Number of the song in the queue"***  Skip to the chosen number in the queue
+- **`?queue`**  Display queued songs/musics
+- **`?queueto`** ***"Number of the page in the queue"***  Display the chosen page of the queued songs/musics
+- **`?clear`**  Clear the queue
+- **`?volume`** ***"Number of 0 to 100"***  Set the volume for the player
+- **`?stop`**  Stop playing, leave joined voice channel and clear the queue
+- **`?help`**  Display all commands and manuals
+
+**Noted: Also work the same for Slash Commands "/" as well.**
