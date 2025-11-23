@@ -11,23 +11,25 @@ from discord import Interaction, app_commands, Embed
 from yt_dlp import YoutubeDL
 from music_player import join_channel, channelValidation, disconnect_timer
 import re
+from dotenv import load_dotenv
+import shlex
 
 
 class Player(commands.Cog):
     
     def __init__(self, bot):
-        
-        path = str(Path.cwd()).split('\\')
-        path[len(path) - 1] = "ffmpeg-master-latest-win64-gpl\\bin\\ffmpeg.exe"
-        
-        self.ffmpegPath = '\\'.join(path)
+        load_dotenv()
+        self.ffmpegPath = os.environ['FFMPEG_PATH']
         self.bot = bot
-        self.ydl = YoutubeDL({"extractor_args": {"youtube": {"player_client": ["web"]}}, 'format': 'bestaudio/best', "ignoreerrors": True, "extract_flat": True, "no_warnings": True, "skip_download": True})
+        # self.ydl = YoutubeDL({"extractor_args": {"youtube": {"player_client": ["web"]}}, 'format': 'bestaudio/best', "ignoreerrors": True, "extract_flat": True, "no_warnings": True, "skip_download": True})
+        self.ydl = YoutubeDL({"extractor_args": {"youtube": {}}, 'format': 'bestaudio/best', "ignoreerrors": True, "extract_flat": True, "no_warnings": True, "skip_download": True})
         self.playlist = {}
         self.vol = {}
+        self.logFile = log_file = open("ffmpeg_debug.log", "w")
         self.FFMPEG_OPTIONS = { 'before_options': '-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5 -probesize 300M',
-                                'options': '-vn'}
-        self.yt_dlp_cmd = 'yt-dlp --simulate --extractor-args "youtube:player_client=web" --skip-download --ignore-errors --quiet --flat-playlist --print playlist_title --print title --print original_url --print duration --encoding utf-8'
+                                'options': '-vn -loglevel debug'}
+        # self.yt_dlp_cmd = 'yt-dlp --simulate --extractor-args "youtube:player_client=web" --skip-download --ignore-errors --quiet --flat-playlist --print playlist_title --print title --print original_url --print duration --encoding utf-8'
+        self.yt_dlp_cmd = 'yt-dlp --simulate --skip-download --ignore-errors --quiet --flat-playlist --print playlist_title --print title --print original_url --print duration --encoding utf-8'
         
     
     @commands.hybrid_command(name="play", description="Play audio/music in voice channel")
@@ -57,59 +59,64 @@ class Player(commands.Cog):
     
     async def play_musics(self, ctx, text_channel_id, skip):
         
-        async with ctx.typing():
+        try:
+            async with ctx.typing():
              
-            channels = join_channel.JoinChannel(self.bot).v_channels_connected
-            guildId = str(ctx.guild.id).strip()
-            playlist = self.playlist
+                channels = join_channel.JoinChannel(self.bot).v_channels_connected
+                guildId = str(ctx.guild.id).strip()
+                playlist = self.playlist
 
-            if(guildId in channels):
-                voice_channel = channelValidation.ChannelValidation(channels=channels, guildId=guildId)
-                current_channel = channels[guildId]
-                
-                if(voice_channel.in_Voice_Channel()):
+                if(guildId in channels):
+                    voice_channel = channelValidation.ChannelValidation(channels=channels, guildId=guildId)
+                    current_channel = channels[guildId]
                     
-                    if(not voice_channel.isPlaying()):
+                    if(voice_channel.in_Voice_Channel()):
                         
-                        if(guildId in playlist):
+                        if(not voice_channel.isPlaying()):
                             
-                            try:
-                                info = self.ydl.extract_info(playlist[guildId][0]["url"], download=False)
+                            if(guildId in playlist):
                                 
-                                if(info != None):
-                                    opu = discord.FFmpegPCMAudio(source= info["url"], executable= self.ffmpegPath, **self.FFMPEG_OPTIONS)
-                                    current_channel.play(opu, after= lambda e: asyncio.run_coroutine_threadsafe(self.play_next(ctx, text_channel_id, skip), self.bot.loop))
-                                    channels[guildId].source = discord.PCMVolumeTransformer(current_channel.source, 10/100 if not guildId in self.vol else self.vol[guildId])
-                                    user = await ctx.guild.fetch_member(playlist[guildId][0]["userId"])
-                                    embed = self.playing_embed(title=info["title"], icon_thumbnail="https://encrypted-tbn0.gstatic.com/images?q=tbn:ANd9GcST8wdNfmD5TMIpIQ71p2O1MiBx2GFS8M9NzyHFsmyplw&s",
-                                                               thumbnail=info["thumbnail"], url=playlist[guildId][0]["url"], duration=self.cal_duration(info["duration"]), user=user)
-                                    join_channel.JoinChannel(self.bot).disconnect_timer[guildId].cancel()
+                                try:
+                                    info = self.ydl.extract_info(playlist[guildId][0]["url"], download=False)
                                     
+                                    if(info != None):
+                                        opu = discord.FFmpegPCMAudio(source= info["url"], executable= self.ffmpegPath, **self.FFMPEG_OPTIONS, stderr=self.logFile)
+                                        current_channel.play(opu, after= lambda e: asyncio.run_coroutine_threadsafe(self.play_next(ctx, text_channel_id, skip), self.bot.loop))
+                                        channels[guildId].source = discord.PCMVolumeTransformer(current_channel.source, 10/100 if not guildId in self.vol else self.vol[guildId])
+                                        user = await ctx.guild.fetch_member(playlist[guildId][0]["userId"])
+                                        embed = self.playing_embed(title=info["title"], icon_thumbnail="https://encrypted-tbn0.gstatic.com/images?q=tbn:ANd9GcST8wdNfmD5TMIpIQ71p2O1MiBx2GFS8M9NzyHFsmyplw&s",
+                                                                thumbnail=info["thumbnail"], url=playlist[guildId][0]["url"], duration=self.cal_duration(info["duration"]), user=user)
+                                        
+                                        if(not channelValidation.ChannelValidation(channels=channels, guildId=guildId).isPaused()): join_channel.JoinChannel(self.bot).disconnect_timer[guildId].cancel()
+                                        
+                                        await ctx.send(embed=embed)
+                                    else:
+                                        embed = Embed(colour=discord.Colour.brand_red(), description=f'[{self.playlist[guildId][0]["title"]}](<{self.playlist[guildId][0]["url"]}>) is not available, skip to next song.')
+        
+                                        await ctx.send(embed=embed) 
+                                        await self.play_next(ctx, text_channel_id, skip)
+                                        
+                                except Exception as e:
+                                    print(e)
+                                    embed = Embed(colour=discord.Colour.brand_red(), description="Error occurred :face_with_spiral_eyes:")
                                     await ctx.send(embed=embed)
-                                else:
-                                    embed = Embed(colour=discord.Colour.brand_red(), description=f'[{self.playlist[guildId][0]["title"]}](<{self.playlist[guildId][0]["url"]}>) is not available, skip to next song.')
-       
-                                    await ctx.send(embed=embed) 
-                                    await self.play_next(ctx, text_channel_id, skip)
-                                    
-                            except Exception as e:
-                                print(e)
-                                embed = Embed(colour=discord.Colour.brand_red(), description="Error occurred :face_with_spiral_eyes:")
+                                
+                            else:
+                                embed = Embed(colour=discord.Colour.brand_red(), description="Didn't have any songs in playlist/queue to play.")
                                 await ctx.send(embed=embed)
-                            
-                        else:
-                            embed = Embed(colour=discord.Colour.brand_red(), description="Didn't have any songs in playlist/queue to play.")
-                            await ctx.send(embed=embed)
 
+                        else:
+                            embed = Embed(colour=discord.Colour.blurple(), description="Is playing right now.")
+                            # await ctx.send(embed=embed)
                     else:
-                        embed = Embed(colour=discord.Colour.blurple(), description="Is playing right now.")
-                        # await ctx.send(embed=embed)
+                        embed = Embed(colour=discord.Colour.brand_red(), description="Not in voice channel :face_with_spiral_eyes:")
+                        await ctx.send(embed=embed)           
                 else:
                     embed = Embed(colour=discord.Colour.brand_red(), description="Not in voice channel :face_with_spiral_eyes:")
-                    await ctx.send(embed=embed)           
-            else:
-                embed = Embed(colour=discord.Colour.brand_red(), description="Not in voice channel :face_with_spiral_eyes:")
-                await ctx.send(embed=embed)
+                    await ctx.send(embed=embed)
+                    
+        except Exception as e:
+                print(f"{e} <<<<<<<")
             
     
     async def play_next(self, ctx, text_channel_id, skip):
@@ -440,7 +447,7 @@ class Player(commands.Cog):
     @app_commands.describe(url="Youtube link/Url")
     async def add(self, ctx: commands.Context, url):
         guildId = str(ctx.guild.id)
-        
+
         async with ctx.typing():
             
             try:
@@ -477,7 +484,7 @@ class Player(commands.Cog):
                 else:
                     completed_url = rUrl
                     
-                cmd = subprocess.Popen(f'{self.yt_dlp_cmd} {completed_url}', stdout=subprocess.PIPE)
+                cmd = subprocess.Popen(shlex.split(f'{self.yt_dlp_cmd} {completed_url}'), stdout=subprocess.PIPE)
                 out, err = cmd.communicate()
                 info = {}
                     
@@ -594,7 +601,7 @@ class Player(commands.Cog):
         
     @add.autocomplete("url")
     async def add_autocomplete(self: commands.Bot, interact: Interaction, current: str):
-    
+        await interact.response.defer()
         if(current.strip() != ""):
             
             try:
@@ -630,12 +637,12 @@ class Player(commands.Cog):
                 else:
                     completed_url = url.strip()
                     
-                cmd = subprocess.Popen(f'{self.yt_dlp_cmd} {completed_url}', stdout=subprocess.PIPE)
+                cmd = subprocess.Popen(shlex.split(f'{self.yt_dlp_cmd} {completed_url}'), stdout=subprocess.PIPE)
                 out, err = cmd.communicate()
 
                 if(cmd.returncode == 0):
                     result = str(out.decode(encoding="utf-8", errors="ignore").strip()).split('\n')
-        
+                    
                     if(len(result) > 0):
                         await interact.response.autocomplete([app_commands.Choice(name=f'{result[0] if result[0] != "NA" else result[1]}', value=completed_url)])
                     else:
@@ -651,6 +658,7 @@ class Player(commands.Cog):
                 
             except Exception as e:
                 print(e)
+      
         else:
             await interact.response.autocomplete([])
             
