@@ -1,8 +1,10 @@
-/Include
-/Lib
-/Scripts
-/share
-pyvenv.cfg
-/ffmpeg-master-latest-win64-gpl/bin
-/ffmpeg-master-latest-win64-gpl/doc
-/src/music_player/__pycache__
+/venv
+/ffmpeg
+__pycache__/
+*.pyc
+.claude
+
+# Secrets - never commit
+.env
+*.env
+!.env.example

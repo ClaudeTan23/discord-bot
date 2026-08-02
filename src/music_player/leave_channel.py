@@ -1,31 +1,32 @@
-import discord 
+"""Voice channel disconnection command."""
+
+from __future__ import annotations
+
+import logging
+
 from discord.ext import commands
-from discord import app_commands as appCommand
-from music_player import join_channel
-from discord import Embed
+
+from music_player import ui
+from music_player.state import MusicState
+
+log = logging.getLogger(__name__)
+
 
 class LeaveChannel(commands.Cog):
-    
-    def __init__(self, bot):
+    """Disconnects the bot from its current voice channel."""
+
+    def __init__(self, bot: commands.Bot, state: MusicState) -> None:
         self.bot = bot
-        
+        self.state = state
+
     @commands.hybrid_command(name="leave", description="Leave current joined voice channel")
-    async def leave(self, ctx):
-        guildId = str(ctx.guild.id)
-        voice_channels = join_channel.JoinChannel(self.bot).v_channels_connected
-        
-        if(str(guildId) in voice_channels):
-            
-            if(not voice_channels.get(guildId).is_playing()):
-                join_channel.JoinChannel(self.bot).disconnect_timer[guildId].cancel()
-            
-            join_channel.JoinChannel(self.bot).ignore_status[guildId] = True    
-            embed = Embed(colour=discord.Colour.brand_green(), description=f":white_check_mark: Have leave the voice channel.")
-            await voice_channels.get(guildId).disconnect()
-            
-            voice_channels.pop(guildId)
-            await ctx.send(embed=embed)
-        else:
-            embed = Embed(colour=discord.Colour.brand_red(), description=f"Did not join any voice channel.")
-            await ctx.send(embed=embed)
-        
+    async def leave(self, ctx: commands.Context) -> None:
+        state = self.state.get(ctx.guild.id)
+
+        if not state.connected:
+            await ctx.send(embed=ui.error("Did not join any voice channel."))
+            return
+
+        state.suppress_advance = True
+        await state.disconnect()
+        await ctx.send(embed=ui.success(":white_check_mark: Have leave the voice channel."))

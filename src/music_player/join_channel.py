@@ -1,108 +1,116 @@
-import time
+"""Voice channel connection commands."""
+
+from __future__ import annotations
+
+import logging
 from typing import List
+
 import discord
-from discord import Interaction, Embed
+from discord import Interaction
 from discord import app_commands as appCommand
 from discord.ext import commands
 
-from music_player import disconnect_timer
+from music_player import ui
+from music_player.state import MusicState
+
+log = logging.getLogger(__name__)
+
+
 class JoinChannel(commands.Cog):
-    
-    v_channels_connected = {}
-    disconnect_timer = {}
-    skip_status = {}
-    ignore_status = {}
-    
-    def __init__(self, bot):
+    """Connects the bot to, and moves it between, voice channels."""
+
+    def __init__(self, bot: commands.Bot, state: MusicState) -> None:
         self.bot = bot
-        
+        self.state = state
+
     @commands.hybrid_command(name="join", description="Join voice channel")
     @appCommand.describe(channel="Choose Voice Channel to join #voice channel id")
-    async def join(self, ctx: commands.context, channel):
-        listChannel = [
-            str(channel.id).strip()
-            for channel in ctx.guild.voice_channels
-        ]
+    async def join(self, ctx: commands.Context, channel: str) -> None:
+        target = self._resolve_channel(ctx, channel)
+        if target is None:
+            await ctx.send(embed=ui.error("Invalid voice channel."))
+            return
 
-        if(channel in listChannel):
-            voice_channel = await ctx.guild.fetch_channel(int(channel))
-            guildId = ctx.guild.id
-            connected_channels = self.v_channels_connected
-            
-            if(not str(guildId) in connected_channels):
-                voice_connected = await voice_channel.connect()
-                self.v_channels_connected[str(guildId)] = voice_connected
-                embed = Embed(colour=discord.Colour.brand_green(), description=f":white_check_mark: Joined **`{voice_channel.name}`** voice channel.")
-                disconnect_timer.Disconnect_timer(self.bot, str(guildId)).timer()
-                self.initial_skip_status(str(guildId))
-                
-                await ctx.send(embed=embed)
+        state = self.state.get(ctx.guild.id)
+
+        try:
+            # A voice client that dropped its connection cannot be reused;
+            # clear it out before reconnecting.
+            if state.voice is not None and not state.voice.is_connected():
+                await state.disconnect()
+
+            if not state.connected:
+                state.voice = await target.connect()
+                state.schedule_idle_disconnect()
+                await ctx.send(
+                    embed=ui.success(
+                        f":white_check_mark: Joined **`{target.name}`** voice channel."
+                    )
+                )
+                return
+
+            if state.voice.channel.id == target.id:
+                await ctx.send(
+                    embed=ui.error("The selected voice channel had already connected.")
+                )
+                return
+
+            was_playing = state.playing
+            if was_playing:
+                state.voice.pause()
+                state.suppress_advance = True
+
+            await state.voice.move_to(target)
+            state.schedule_idle_disconnect()
+
+            if was_playing:
+                await ctx.send(
+                    embed=ui.success(
+                        f":white_check_mark: Paused audio and move to "
+                        f"**`{target.name}`** voice channel."
+                    )
+                )
             else:
-                if(self.v_channels_connected[str(guildId)].channel.id == int(channel)):
-                    
-                    if(self.v_channels_connected[str(guildId)].is_connected()):
-                        embed = Embed(colour=discord.Colour.brand_red(), description="The selected voice channel had already connected.")
-                        await ctx.send(embed=embed)
-                    else:
-                        voice_connected = await voice_channel.connect()
-                        self.v_channels_connected[str(guildId)] = voice_connected
-                        embed = Embed(colour=discord.Colour.brand_green(), description=f":white_check_mark: Joined **`{voice_channel.name}`** voice channel.")
-                        disconnect_timer.Disconnect_timer(self.bot, str(guildId)).timer()
-                        self.initial_skip_status(str(guildId))
-                        
-                        await ctx.send(embed=embed)
-                else:
-                    if(self.v_channels_connected[str(guildId)].is_playing()):
-                        self.v_channels_connected[str(guildId)].pause()
-                        
-                        await self.v_channels_connected[str(guildId)].move_to(discord.Object(id=int(channel)))
-                        disconnect_timer.Disconnect_timer(self.bot, str(guildId)).timer()
-                        embed = Embed(colour=discord.Colour.brand_green(), description=f":white_check_mark: Paused audio and move to **`{voice_channel.name}`** voice channel.")
-                        await ctx.send(embed=embed)
-                        
-                    else:
-                        voice_connected = await self.v_channels_connected[str(guildId)].move_to(discord.Object(id=int(channel)))
-                        embed = Embed(colour=discord.Colour.brand_green(), description=f":white_check_mark: Have move to **`{voice_channel.name}`** voice channel.")
-                        disconnect_timer[guildId].cancel()
-                        disconnect_timer.Disconnect_timer(self.bot, str(guildId)).timer()
-                    
-                        await ctx.send(embed=embed)              
-        else:
-            await ctx.send("Invalid voice channel.")
-        
-        
-    @join.autocomplete("channel")
-    async def join_autocomplete(self: commands.Bot, interact: Interaction, current: str) -> List[appCommand.Choice[str]]:
-        voice_channels = interact.guild.voice_channels
-        listChannel = []
-        
-        for channel in voice_channels:
-            listChannel.append({"name": channel.name, "id": channel.id})
+                await ctx.send(
+                    embed=ui.success(
+                        f":white_check_mark: Have move to **`{target.name}`** "
+                        f"voice channel."
+                    )
+                )
+        except discord.ClientException:
+            log.exception("voice connect failed in guild %s", ctx.guild.id)
+            await ctx.send(embed=ui.error("Could not connect to that voice channel."))
+        except Exception:
+            log.exception("unexpected join failure in guild %s", ctx.guild.id)
+            await ctx.send(embed=ui.generic_error())
 
+    @staticmethod
+    def _resolve_channel(
+        ctx: commands.Context, raw: str
+    ) -> discord.VoiceChannel | None:
+        """Look the channel up in the guild cache instead of hitting the API."""
+        try:
+            channel_id = int(str(raw).strip())
+        except (TypeError, ValueError):
+            return None
+        return discord.utils.get(ctx.guild.voice_channels, id=channel_id)
+
+    @join.autocomplete("channel")
+    async def join_autocomplete(
+        self, interaction: Interaction, current: str
+    ) -> List[appCommand.Choice[str]]:
+        needle = current.lower().strip()
         return [
-            appCommand.Choice(name=channel["name"], value=str(channel["id"]))
-            for channel in listChannel if current.lower().strip() in channel["name"].lower().strip()
-        ]
-    
+            appCommand.Choice(name=channel.name[:100], value=str(channel.id))
+            for channel in interaction.guild.voice_channels
+            if needle in channel.name.lower()
+        ][:25]  # Discord caps autocomplete at 25 choices.
+
     @join.error
-    async def error(self, ctx, error: appCommand.AppCommandError):
-        errorType = type(error)
-        
-        if(errorType == commands.errors.MissingRequiredArgument):
-            embed = Embed(colour=discord.Colour.brand_red(), description="Missing required **`option/argument`** in the command.")
-            await ctx.send(embed=embed)
-            
-    
-    def initial_skip_status(self, guildId):
-        skip_status = self.skip_status
-        ignore_status = self.ignore_status
-        
-        if(not guildId in skip_status):
-            skip_status[guildId] = False
+    async def join_error(self, ctx: commands.Context, error: Exception) -> None:
+        if isinstance(error, commands.MissingRequiredArgument):
+            await ctx.send(
+                embed=ui.error("Missing required **`option/argument`** in the command.")
+            )
         else:
-            skip_status[guildId] = False
-            
-        if(not guildId in ignore_status):
-            ignore_status[guildId] = False
-        else:
-            ignore_status[guildId] = False
+            log.error("join command error: %s", error)
