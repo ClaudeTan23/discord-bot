@@ -22,7 +22,7 @@ from typing import Awaitable, Callable, Dict, List, Optional, Tuple, TypeVar
 from urllib.parse import parse_qs, urlparse
 
 from yt_dlp import YoutubeDL
-from yt_dlp.utils import DownloadError
+from yt_dlp.utils import DownloadError, YoutubeDLError
 
 from music_player.config import (
     AUTOCOMPLETE_TIMEOUT,
@@ -70,7 +70,12 @@ _COMMON_OPTS = {
 _FLAT_OPTS = {**_COMMON_OPTS, "extract_flat": "in_playlist"}
 
 #: Resolving audio for playback needs the real format list.
-_STREAM_OPTS = {**_COMMON_OPTS, "format": "bestaudio/best"}
+#:
+#: ``ignoreerrors`` is deliberately off here, unlike everywhere else. With it on,
+#: yt-dlp returned ``None`` for *any* failure, so a transient 429 or a network
+#: blip was reported as the same "no audio stream" as a permanently blocked
+#: video - and the track was skipped for good with the real reason discarded.
+_STREAM_OPTS = {**_COMMON_OPTS, "format": "bestaudio/best", "ignoreerrors": False}
 
 #: Autocomplete only needs a label, so stop after the playlist's first entry
 #: instead of walking every video in it.
@@ -97,6 +102,10 @@ class FetchResult:
 
     entries: List[TrackInfo]
     playlist_title: Optional[str] = None
+    #: Playlist entries dropped as unplayable (deleted, private, or pulled by a
+    #: copyright claim). Reported to the user, who otherwise just sees a queue
+    #: shorter than the playlist with no explanation.
+    unavailable: int = 0
 
     @property
     def is_playlist(self) -> bool:
@@ -109,6 +118,10 @@ class StreamInfo:
     title: str
     duration: int
     thumbnail: Optional[str]
+    #: The headers yt-dlp used to obtain ``stream_url``. ffmpeg fetches that URL
+    #: as a separate client, and googlevideo is more willing to 403 a request
+    #: whose User-Agent does not match the one the URL was issued to.
+    http_headers: Optional[Dict[str, str]] = None
 
 
 def normalize_url(raw: str) -> str:
@@ -323,10 +336,15 @@ class YouTubeService:
             raise ExtractionError(f"no metadata for {url}")
 
         if info.get("_type") == "playlist":
-            entries = [t for t in map(_to_track, info.get("entries") or []) if t]
+            raw = info.get("entries") or []
+            entries = [t for t in map(_to_track, raw) if t]
             if not entries:
                 raise ExtractionError("playlist contained no playable videos")
-            result = FetchResult(entries=entries, playlist_title=info.get("title") or "")
+            result = FetchResult(
+                entries=entries,
+                playlist_title=info.get("title") or "",
+                unavailable=len(raw) - len(entries),
+            )
         else:
             track = _to_track(info)
             if track is None:
@@ -425,6 +443,14 @@ class YouTubeService:
             f"stream:{url}", lambda: self._resolve_stream(url)
         )
 
+    def invalidate_stream(self, url: str) -> None:
+        """Forget the cached stream URL for ``url``.
+
+        Used when ffmpeg could not actually read a URL we handed it, so the
+        retry resolves a fresh one instead of replaying the dead link.
+        """
+        self._stream_cache.pop(url, None)
+
     async def _resolve_stream(self, url: str) -> StreamInfo:
         cached = self._stream_cache_get(url)
         if cached is not None:
@@ -432,7 +458,7 @@ class YouTubeService:
 
         try:
             info = await self._run(url, _STREAM_OPTS)
-        except DownloadError as exc:
+        except YoutubeDLError as exc:
             raise ExtractionError(str(exc)) from exc
 
         if not info or not info.get("url"):
@@ -443,6 +469,7 @@ class YouTubeService:
             title=info.get("title") or "Unknown title",
             duration=_coerce_duration(info.get("duration")) or 0,
             thumbnail=info.get("thumbnail"),
+            http_headers=info.get("http_headers") or None,
         )
         self._stream_cache_put(url, stream)
         return stream

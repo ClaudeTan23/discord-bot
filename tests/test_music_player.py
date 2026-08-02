@@ -543,6 +543,7 @@ class FakeVoice:
 class FakeYouTube:
     def __init__(self):
         self.prefetched: list = []
+        self.invalidated: list = []
 
     async def resolve_stream(self, url):
         from music_player.ytdl import StreamInfo
@@ -552,6 +553,9 @@ class FakeYouTube:
 
     def prefetch_stream(self, url):
         self.prefetched.append(url)
+
+    def invalidate_stream(self, url):
+        self.invalidated.append(url)
 
 
 class TestPlayResponds(unittest.IsolatedAsyncioTestCase):
@@ -1141,6 +1145,171 @@ class TestConcurrency(unittest.IsolatedAsyncioTestCase):
         await asyncio.gather(*[add(n) for n in range(10)])
         self.assertEqual(len(state.queue), 50)
         self.assertEqual(len({t.url for t in state.queue}), 50)
+
+
+class TestSilentSkip(unittest.IsolatedAsyncioTestCase):
+    """A track announced as now-playing that produces no audio.
+
+    ffmpeg exits 0 when googlevideo answers a stream URL with 403, so the voice
+    after-callback saw an ordinary completion and advanced. The song was
+    announced, played silence, and vanished with nothing in the log.
+    """
+
+    def _player(self, youtube=None):
+        from unittest.mock import MagicMock
+        from music_player.player import Player
+
+        bot = MagicMock()
+        bot.user = MagicMock()
+        bot.loop = asyncio.get_running_loop()
+        player = Player(bot, MusicState(), youtube or FakeYouTube())
+        player.ffmpeg_path = "ffmpeg"
+        return player
+
+    @staticmethod
+    def _state(songs=3, duration=240):
+        state = GuildState(1)
+        state.voice = FakeVoice()
+        for i in range(songs):
+            state.queue.append(
+                Track(f"{WATCH}&i={i}", f"Song {i}", duration, 42, "t")
+            )
+        return state
+
+    @staticmethod
+    def _patched():
+        from unittest.mock import MagicMock, patch
+        import music_player.player as mp
+
+        return (
+            patch.object(mp.discord, "FFmpegPCMAudio", MagicMock()),
+            patch.object(mp.discord, "PCMVolumeTransformer", MagicMock()),
+        )
+
+    # -- detection ------------------------------------------------------
+
+    def test_instant_end_of_a_long_track_is_a_failure(self):
+        from music_player.player import Player
+
+        state = self._state()
+        self.assertTrue(Player._ended_early(state, state.current, 0.2))
+
+    def test_a_finished_track_is_not_a_failure(self):
+        from music_player.player import Player
+
+        state = self._state()
+        self.assertFalse(Player._ended_early(state, state.current, 240.0))
+
+    def test_a_user_skip_is_not_a_failure(self):
+        """?skip ends a track early on purpose; retrying would fight the user."""
+        from music_player.player import Player
+
+        state = self._state()
+        state.skip_requested = True
+        self.assertFalse(Player._ended_early(state, state.current, 0.2))
+
+    def test_pause_is_not_a_failure(self):
+        from music_player.player import Player
+
+        state = self._state()
+        state.suppress_advance = True
+        self.assertFalse(Player._ended_early(state, state.current, 0.2))
+
+    def test_very_short_tracks_are_not_judged(self):
+        """A 3s clip legitimately ends in about 3s."""
+        from music_player.player import Player
+
+        state = self._state(duration=3)
+        self.assertFalse(Player._ended_early(state, state.current, 0.2))
+
+    # -- recovery -------------------------------------------------------
+
+    async def test_a_silent_track_is_retried_on_a_fresh_url(self):
+        player = self._player()
+        state = self._state()
+        channel = FakeChannel()
+        head = state.current
+
+        p1, p2 = self._patched()
+        with p1, p2:
+            state.playback_started = time.monotonic()  # "played" ~0s
+            player._on_track_end(None, channel, state, head)
+            await asyncio.sleep(0.05)
+
+        self.assertEqual(player.youtube.invalidated, [head.url],
+                         "the dead URL must not be replayed from cache")
+        self.assertIs(state.current, head, "the track must not be skipped")
+        self.assertEqual(state.voice.play_calls, 1, "it must be restarted")
+
+    async def test_a_second_failure_gives_up_and_says_so(self):
+        player = self._player()
+        state = self._state()
+        channel = FakeChannel()
+        head = state.current
+        state.retried_url = head.url  # the retry already happened
+
+        p1, p2 = self._patched()
+        with p1, p2:
+            state.playback_started = time.monotonic()
+            player._on_track_end(None, channel, state, head)
+            await asyncio.sleep(0.05)
+
+        self.assertIsNot(state.current, head, "must move on after two attempts")
+        self.assertTrue(channel.sent, "the user must be told, not left guessing")
+
+    async def test_a_track_that_played_advances_normally(self):
+        player = self._player()
+        state = self._state()
+        channel = FakeChannel()
+        head = state.current
+
+        p1, p2 = self._patched()
+        with p1, p2:
+            state.playback_started = time.monotonic() - 240
+            player._on_track_end(None, channel, state, head)
+            await asyncio.sleep(0.05)
+
+        self.assertIsNot(state.current, head)
+        self.assertEqual(player.youtube.invalidated, [], "nothing was wrong")
+
+    async def test_the_retry_marker_clears_between_tracks(self):
+        """Otherwise one bad song would spend the next song's retry."""
+        player = self._player()
+        state = self._state()
+        state.retried_url = state.current.url
+        channel = FakeChannel()
+
+        p1, p2 = self._patched()
+        with p1, p2:
+            await player._advance(channel, state, forced=True)
+
+        self.assertIsNone(state.retried_url)
+
+
+class TestUnavailableCount(unittest.TestCase):
+    """A playlist's dead entries are dropped; the user must hear about it."""
+
+    def test_fetch_result_counts_dropped_entries(self):
+        from music_player.ytdl import FetchResult
+
+        self.assertEqual(FetchResult(entries=[]).unavailable, 0)
+        self.assertEqual(
+            FetchResult(entries=[], playlist_title="p", unavailable=39).unavailable, 39
+        )
+
+    def test_added_embed_reports_unavailable(self):
+        from music_player import ui
+
+        track = Track(WATCH, "Song", 10, 42, "t")
+        body = ui.added(track, extra_count=159, unavailable=39).description
+        self.assertIn("159", body)
+        self.assertIn("39", body)
+
+    def test_added_embed_is_unchanged_when_nothing_was_dropped(self):
+        from music_player import ui
+
+        track = Track(WATCH, "Song", 10, 42, "t")
+        self.assertNotIn("unavailable", ui.added(track, extra_count=5).description)
 
 
 if __name__ == "__main__":

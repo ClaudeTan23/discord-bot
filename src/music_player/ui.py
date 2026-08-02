@@ -138,13 +138,20 @@ def all_played() -> Embed:
     )
 
 
-def added(track: Track, extra_count: int = 0) -> Embed:
-    """Confirmation for ``?add``; ``extra_count`` covers the playlist case."""
+def added(track: Track, extra_count: int = 0, unavailable: int = 0) -> Embed:
+    """Confirmation for ``?add``; ``extra_count`` covers the playlist case.
+
+    ``unavailable`` is stated rather than swallowed: a playlist whose deleted
+    and copyright-struck entries are dropped in silence looks like the bot lost
+    songs, or skipped them at random once playback reached that point.
+    """
     link = track_link(track)
     if extra_count > 0:
         body = f"Added {link} and {extra_count} songs in to playlist."
     else:
         body = f"Added {link} in to playlist."
+    if unavailable > 0:
+        body += f"\nSkipped {unavailable} unavailable video(s)."
     return Embed(colour=discord.Colour.dark_blue(), description=body)
 
 

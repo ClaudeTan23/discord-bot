@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import shlex
+import time
 from typing import List, Optional
 
 import discord
@@ -16,6 +18,8 @@ from music_player.config import (
     ADD_RATE,
     FFMPEG_BEFORE_OPTIONS,
     FFMPEG_OPTIONS,
+    MIN_PLAYED_FRACTION,
+    PLAYBACK_FAILURE_SECONDS,
     QUEUE_PAGE_SIZE,
     QUEUE_PER,
     QUEUE_RATE,
@@ -24,6 +28,7 @@ from music_player.config import (
 from music_player.state import GuildState, MusicState, Track
 from music_player.ytdl import (
     ExtractionError,
+    StreamInfo,
     YouTubeService,
     is_complete_query,
     normalize_url,
@@ -33,6 +38,57 @@ log = logging.getLogger(__name__)
 
 #: Discord rejects autocomplete choices whose name or value exceeds 100 chars.
 _CHOICE_LIMIT = 100
+
+#: Forwarded to ffmpeg so its request for the stream looks like the one the URL
+#: was issued to. Anything else yt-dlp reports is irrelevant to fetching audio.
+_FORWARDED_HEADERS = ("User-Agent", "Cookie", "Referer")
+
+
+class _FFmpegLog:
+    """File-like sink that routes ffmpeg's stderr into ``logging``.
+
+    discord.py leaves ffmpeg's stderr attached to the bot's own, so the reason a
+    stream failed - typically ``Server returned 403 Forbidden`` - never reached
+    the log file. A song that ffmpeg could not read was therefore
+    indistinguishable from one that simply ended.
+
+    Deliberately has no ``fileno``: that is how discord.py decides to pump the
+    subprocess's stderr through a reader thread into this object.
+    """
+
+    __slots__ = ("_url",)
+
+    def __init__(self, url: str) -> None:
+        self._url = url
+
+    def write(self, data: bytes) -> int:
+        text = data.decode("utf-8", "replace").strip()
+        if text:
+            log.warning("ffmpeg [%s]: %s", self._url, text)
+        return len(data)
+
+    def flush(self) -> None:  # pragma: no cover - required by the file protocol
+        pass
+
+
+def _before_options(stream: StreamInfo) -> str:
+    """Static ffmpeg input options plus the headers this stream needs.
+
+    discord.py parses the string with ``shlex.split``, so the header block is
+    quoted rather than interpolated raw - a title or cookie containing a space
+    would otherwise split into separate arguments.
+    """
+    headers = stream.http_headers or {}
+    lines = [
+        f"{name}: {value}"
+        for name in _FORWARDED_HEADERS
+        # A newline here would let an upstream value inject extra headers.
+        if (value := str(headers.get(name, "")).replace("\r", "").replace("\n", ""))
+    ]
+    if not lines:
+        return FFMPEG_BEFORE_OPTIONS
+    block = "".join(f"{line}\r\n" for line in lines)
+    return f"-headers {shlex.quote(block)} {FFMPEG_BEFORE_OPTIONS}"
 
 
 class Player(commands.Cog):
@@ -149,11 +205,13 @@ class Player(commands.Cog):
             source = discord.FFmpegPCMAudio(
                 stream.stream_url,
                 executable=self.ffmpeg_path,
-                before_options=FFMPEG_BEFORE_OPTIONS,
+                before_options=_before_options(stream),
                 options=FFMPEG_OPTIONS,
+                stderr=_FFmpegLog(track.url),
             )
             # Wrapping before play() means voice.source is the transformer, so
             # ?volume can adjust it live.
+            state.playback_started = time.monotonic()
             state.voice.play(
                 discord.PCMVolumeTransformer(source, volume=state.volume),
                 after=lambda err: self._on_track_end(err, channel, state, track),
@@ -207,9 +265,82 @@ class Player(commands.Cog):
         """Voice ``after`` callback. Runs on a non-async thread."""
         if error is not None:
             log.error("playback error in guild %s: %s", state.guild_id, error)
-        asyncio.run_coroutine_threadsafe(
-            self._advance(channel, state, forced=False, expect=track), self.bot.loop
+
+        played = time.monotonic() - state.playback_started
+        if not self._ended_early(state, track, played):
+            coro = self._advance(channel, state, forced=False, expect=track)
+        elif state.retried_url == track.url:
+            # Already given a second chance on a fresh URL. Say so rather than
+            # letting a third song silently fly past.
+            coro = self._give_up(channel, state, track, played)
+        else:
+            state.retried_url = track.url
+            coro = self._retry_current(channel, state, track, played)
+        asyncio.run_coroutine_threadsafe(coro, self.bot.loop)
+
+    @staticmethod
+    def _ended_early(state: GuildState, track: Track, played: float) -> bool:
+        """Did this track end because ffmpeg could not read it?
+
+        ffmpeg exits 0 when the stream URL answers 403, so the after-callback
+        cannot tell "finished" from "never started" - the symptom being a song
+        announced as now-playing that produces silence and disappears. Comparing
+        elapsed audio against the known duration is what separates them.
+
+        A user-initiated stop is excluded: ?skip and ?pause end a track early on
+        purpose, and neither is a failure.
+        """
+        if state.skip_requested or state.suppress_advance:
+            return False
+        if state.current is not track or not state.connected:
+            return False
+        expected = max(0, track.duration)
+        if expected <= PLAYBACK_FAILURE_SECONDS:
+            return False  # too short to judge against
+        return played < max(PLAYBACK_FAILURE_SECONDS, expected * MIN_PLAYED_FRACTION)
+
+    async def _give_up(
+        self,
+        channel: discord.abc.Messageable,
+        state: GuildState,
+        track: Track,
+        played: float,
+    ) -> None:
+        log.warning(
+            "%s failed again after %.1fs of audio; skipping", track.url, played
         )
+        await channel.send(
+            embed=ui.error(
+                f"Couldn't play the audio for {ui.track_link(track)}, "
+                "skip to next song."
+            )
+        )
+        await self._advance(channel, state, forced=False, expect=track)
+
+    async def _retry_current(
+        self,
+        channel: discord.abc.Messageable,
+        state: GuildState,
+        track: Track,
+        played: float,
+    ) -> None:
+        """Restart the head of the queue on a freshly resolved stream URL.
+
+        The cached URL is dropped first: replaying the link ffmpeg just failed
+        on would only fail again.
+        """
+        log.warning(
+            "%s produced %.1fs of audio but is %ss long - refreshing stream URL",
+            track.url,
+            played,
+            track.duration,
+        )
+        self.youtube.invalidate_stream(track.url)
+        try:
+            await self._play_current(channel, state, forced=False)
+        except Exception:
+            log.exception("retry failed for %s", track.url)
+            await self._advance(channel, state, forced=False, expect=track)
 
     async def _advance(
         self,
@@ -242,10 +373,12 @@ class Player(commands.Cog):
             if len(state.queue) > 1:
                 state.queue.pop(0)
                 state.skip_requested = False
+                state.retried_url = None
                 await self._play_current(channel, state, forced=False)
             else:
                 state.queue.clear()
                 state.skip_requested = False
+                state.retried_url = None
                 state.schedule_idle_disconnect()
                 await channel.send(embed=ui.all_played())
         except Exception:
@@ -329,7 +462,13 @@ class Player(commands.Cog):
                 for entry in result.entries
             ]
             state.queue.extend(tracks)
-            await ctx.send(embed=ui.added(tracks[0], extra_count=len(tracks) - 1))
+            await ctx.send(
+                embed=ui.added(
+                    tracks[0],
+                    extra_count=len(tracks) - 1,
+                    unavailable=result.unavailable,
+                )
+            )
 
     @add.autocomplete("url")
     async def add_autocomplete(
