@@ -41,6 +41,8 @@ class GuildState:
         "skip_requested",
         "suppress_advance",
         "starting",
+        "playback_started",
+        "retried_url",
         "_idle_task",
     )
 
@@ -57,6 +59,13 @@ class GuildState:
         # independent, but a single guild has one audio output, so two
         # concurrent ?play calls must not both start a track.
         self.starting = False
+        # ``time.monotonic()`` when the current track's audio started, so a
+        # track that ends far too early can be told apart from one that
+        # finished. Both look identical to the voice after-callback.
+        self.playback_started: float = 0.0
+        # The one track url already retried after a failed stream, so a URL
+        # that is genuinely dead cannot loop.
+        self.retried_url: Optional[str] = None
         self._idle_task: Optional[asyncio.Task] = None
 
     # -- connection state ---------------------------------------------------
@@ -120,6 +129,8 @@ class GuildState:
         self.skip_requested = False
         self.suppress_advance = False
         self.starting = False
+        self.playback_started = 0.0
+        self.retried_url = None
 
 
 class MusicState:

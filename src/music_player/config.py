@@ -69,10 +69,23 @@ STREAM_MIN_VALIDITY = 3600.0
 #: Fallback when a stream URL carries no ``expire`` parameter.
 STREAM_DEFAULT_TTL = 7200.0
 
+#: ``-reconnect_on_http_error`` is the important one: googlevideo intermittently
+#: answers a valid stream URL with 403/5xx, and without it ffmpeg treats that as
+#: end-of-input and exits 0. The track then "played" for a fraction of a second
+#: and the after-callback advanced, so a perfectly available song was announced
+#: as now-playing, produced silence, and vanished.
 FFMPEG_BEFORE_OPTIONS = (
-    "-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5 -probesize 300M"
+    "-reconnect 1 -reconnect_streamed 1 -reconnect_on_network_error 1 "
+    "-reconnect_on_http_error 4xx,5xx -reconnect_delay_max 5 -probesize 300M"
 )
 FFMPEG_OPTIONS = "-vn"
+
+#: Audio shorter than this never counts as a played track, however short the
+#: song is. Covers the instant-EOF case where ffmpeg could not open the stream.
+PLAYBACK_FAILURE_SECONDS = 5.0
+#: Below this share of a track's known duration, playback is treated as a
+#: stream failure worth one retry rather than a song that finished.
+MIN_PLAYED_FRACTION = 0.5
 
 NOW_PLAYING_ICON = (
     "https://encrypted-tbn0.gstatic.com/images"
