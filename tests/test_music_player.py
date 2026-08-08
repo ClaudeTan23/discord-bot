@@ -22,6 +22,10 @@ import discord  # noqa: E402
 from unittest.mock import MagicMock  # noqa: E402
 
 from music_player import ui  # noqa: E402
+from music_player.audio import (  # noqa: E402
+    FRAME_SIZE,
+    BufferedAudioSource,
+)
 from music_player.state import GuildState, MusicState, Track  # noqa: E402
 from music_player.ytdl import (  # noqa: E402
     FetchResult,
@@ -1310,6 +1314,124 @@ class TestUnavailableCount(unittest.TestCase):
 
         track = Track(WATCH, "Song", 10, 42, "t")
         self.assertNotIn("unavailable", ui.added(track, extra_count=5).description)
+
+
+class _FakeSource(discord.AudioSource):
+    """A PCM source whose reads can be stalled on demand."""
+
+    def __init__(self, frames: int, *, stall: float = 0.0, stall_at: int = -1):
+        self._remaining = frames
+        self._stall = stall
+        self._stall_at = stall_at
+        self._served = 0
+        self.cleaned = False
+
+    def is_opus(self) -> bool:
+        return False
+
+    def read(self) -> bytes:
+        if self._remaining <= 0:
+            return b""
+        if self._served == self._stall_at:
+            time.sleep(self._stall)
+        self._remaining -= 1
+        self._served += 1
+        return bytes([self._served % 251]) * FRAME_SIZE
+
+    def cleanup(self) -> None:
+        self.cleaned = True
+
+
+class TestBufferedAudioSource(unittest.IsolatedAsyncioTestCase):
+    """The buffer exists so discord.py's player never reads late.
+
+    Its loop skips the 20ms sleep for every deadline that has already passed,
+    so a blocked read is paid back as a burst of packets - audio that speeds up
+    and stutters. read() must therefore always return immediately.
+    """
+
+    async def test_frames_pass_through_in_order(self):
+        source = _FakeSource(10)
+        buf = BufferedAudioSource(source, buffer_seconds=1, prefill_seconds=0.1)
+        await buf.wait_until_ready(timeout=2)
+
+        read = []
+        while (frame := buf.read()):
+            read.append(frame)
+
+        self.assertEqual(len(read), 10)
+        self.assertEqual(read, [bytes([i % 251]) * FRAME_SIZE for i in range(1, 11)])
+        buf.cleanup()
+        self.assertTrue(source.cleaned)
+
+    async def test_read_never_blocks_while_the_source_stalls(self):
+        # One frame buffered, then a stall far longer than a 20ms deadline.
+        source = _FakeSource(4, stall=0.4, stall_at=1)
+        buf = BufferedAudioSource(source, buffer_seconds=1, prefill_seconds=0.02)
+        await buf.wait_until_ready(timeout=2)
+
+        started = time.monotonic()
+        for _ in range(5):
+            self.assertEqual(len(buf.read()), FRAME_SIZE)
+        elapsed = time.monotonic() - started
+
+        # Five reads across a 400ms stall, none of which waited for it.
+        self.assertLess(elapsed, 0.1)
+        self.assertGreater(buf.underruns, 0)
+        buf.cleanup()
+
+    async def test_underrun_is_silence_not_a_dropped_frame(self):
+        source = _FakeSource(2, stall=0.3, stall_at=1)
+        buf = BufferedAudioSource(source, buffer_seconds=1, prefill_seconds=0.02)
+        await buf.wait_until_ready(timeout=2)
+
+        first = buf.read()
+        padding = buf.read()
+        self.assertEqual(padding, b"\x00" * FRAME_SIZE)
+
+        # The stalled frame is still delivered afterwards - delayed, not lost.
+        # Read on the player's own 20ms cadence rather than spinning, so the
+        # starvation cut-off is not reached in a few microseconds.
+        frame = b"\x00" * FRAME_SIZE
+        for _ in range(50):
+            frame = buf.read()
+            if frame != b"\x00" * FRAME_SIZE:
+                break
+            time.sleep(0.02)
+
+        self.assertEqual(len(frame), FRAME_SIZE)
+        self.assertNotEqual(frame, first)
+        buf.cleanup()
+
+    async def test_exhausted_source_ends_the_track(self):
+        buf = BufferedAudioSource(_FakeSource(2), buffer_seconds=1, prefill_seconds=1)
+        # Prefill can never be reached, but the source ending must still release
+        # the wait rather than burning the whole timeout.
+        started = time.monotonic()
+        await buf.wait_until_ready(timeout=5)
+        self.assertLess(time.monotonic() - started, 2)
+
+        self.assertEqual(len(buf.read()), FRAME_SIZE)
+        self.assertEqual(len(buf.read()), FRAME_SIZE)
+        self.assertEqual(buf.read(), b"")
+        buf.cleanup()
+
+    async def test_cleanup_releases_a_producer_blocked_on_a_full_buffer(self):
+        # Capacity is one second; the source has far more than that to give.
+        source = _FakeSource(10_000)
+        buf = BufferedAudioSource(source, buffer_seconds=1, prefill_seconds=0.1)
+        await buf.wait_until_ready(timeout=2)
+
+        buf.cleanup()
+        self.assertTrue(source.cleaned)
+        self.assertFalse(buf._thread.is_alive())
+
+    def test_is_opus_is_forwarded(self):
+        # PCMVolumeTransformer refuses an opus source, so this must not lie.
+        buf = BufferedAudioSource(_FakeSource(0))
+        self.assertFalse(buf.is_opus())
+        discord.PCMVolumeTransformer(buf, volume=0.5)
+        buf.cleanup()
 
 
 if __name__ == "__main__":

@@ -13,6 +13,7 @@ from discord import Embed, Interaction, app_commands
 from discord.ext import commands
 
 from music_player import ui
+from music_player.audio import BufferedAudioSource
 from music_player.config import (
     ADD_PER,
     ADD_RATE,
@@ -190,33 +191,55 @@ class Player(commands.Cog):
             await self._advance(channel, state, forced=forced, expect=track)
             return True
 
-        # Resolving took a network round trip, during which another command
-        # may have skipped, cleared or disconnected. Re-validate before
-        # committing - there is no await between here and voice.play(), so
-        # this check and the play form one atomic step.
+        # Start ffmpeg and let it fill the jitter buffer *before* the final
+        # re-validation below, so that check and voice.play() remain a single
+        # atomic step. `starting` stays set across the wait: the guild is
+        # committed to this track from here on.
+        state.starting = True
+        try:
+            source = BufferedAudioSource(
+                discord.FFmpegPCMAudio(
+                    stream.stream_url,
+                    executable=self.ffmpeg_path,
+                    before_options=_before_options(stream),
+                    options=FFMPEG_OPTIONS,
+                    stderr=_FFmpegLog(track.url),
+                ),
+                label=track.url,
+            )
+            await source.wait_until_ready()
+        except Exception:
+            log.exception("failed to start ffmpeg for %s", track.url)
+            await destination.send(embed=ui.generic_error())
+            return True
+        finally:
+            state.starting = False
+
+        # Resolving and buffering took time, during which another command may
+        # have skipped, cleared or disconnected. Re-validate before committing -
+        # there is no await between here and voice.play(), so this check and the
+        # play form one atomic step.
         if not state.connected:
+            source.cleanup()
             await destination.send(embed=ui.not_in_voice())
             return True
         if state.playing or state.current is not track:
+            source.cleanup()
             log.debug("playback for %s superseded while resolving", track.url)
             return False
 
         try:
-            source = discord.FFmpegPCMAudio(
-                stream.stream_url,
-                executable=self.ffmpeg_path,
-                before_options=_before_options(stream),
-                options=FFMPEG_OPTIONS,
-                stderr=_FFmpegLog(track.url),
-            )
             # Wrapping before play() means voice.source is the transformer, so
-            # ?volume can adjust it live.
+            # ?volume can adjust it live. The buffer sits underneath it, so a
+            # volume change applies to the next frame out rather than to audio
+            # queued seconds ago.
             state.playback_started = time.monotonic()
             state.voice.play(
                 discord.PCMVolumeTransformer(source, volume=state.volume),
                 after=lambda err: self._on_track_end(err, channel, state, track),
             )
         except Exception:
+            source.cleanup()
             log.exception("failed to start playback for %s", track.url)
             await destination.send(embed=ui.generic_error())
             return True
