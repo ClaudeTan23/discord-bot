@@ -11,7 +11,7 @@ from dotenv import load_dotenv
 # Repo root: <root>/src/music_player/config.py -> parents[2] == <root>
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 FFMPEG_ROOT = PROJECT_ROOT / "ffmpeg"
-ENV_FILE = PROJECT_ROOT / "src" / ".env"
+ENV_FILE = PROJECT_ROOT / ".env"
 
 # Load .env here, before anything below reads os.environ. Doing it in app.py's
 # main() was too late: this module is imported at module scope, so every
@@ -79,6 +79,31 @@ FFMPEG_BEFORE_OPTIONS = (
     "-reconnect_on_http_error 4xx,5xx -reconnect_delay_max 5 -probesize 300M"
 )
 FFMPEG_OPTIONS = "-vn"
+
+#: Seconds of decoded audio held ahead of the player.
+#:
+#: discord.py sends one 20ms packet per loop and sleeps until the next 20ms
+#: boundary - but the sleep is ``max(0, ...)``. If a read blocks (ffmpeg
+#: reconnecting, a network stall, this process losing the CPU), the boundaries
+#: for the following packets have already passed, so they are sent back to back
+#: until the loop catches up with the wall clock. That burst is what a listener
+#: hears as the audio speeding up and stuttering. Buffering ahead of the player
+#: means a stall shorter than this costs nothing at all.
+#:
+#: Costs 192 KB per second per playing guild. Override with
+#: MUSIC_AUDIO_BUFFER_SECONDS.
+AUDIO_BUFFER_SECONDS = max(
+    1.0, float(os.environ.get("MUSIC_AUDIO_BUFFER_SECONDS", "10"))
+)
+#: Audio queued before playback starts, so the opening seconds get the same
+#: protection as the rest of the track.
+AUDIO_PREFILL_SECONDS = 1.0
+#: Cap on the prefill wait. ffmpeg can simply be slow to reach googlevideo, and
+#: starting with a thin buffer beats not starting.
+AUDIO_PREFILL_TIMEOUT = 3.0
+#: An empty buffer for this long is a dead stream rather than a stall, so the
+#: track ends and the existing retry/skip path takes over.
+AUDIO_UNDERRUN_LIMIT_SECONDS = 15.0
 
 #: Audio shorter than this never counts as a played track, however short the
 #: song is. Covers the instant-EOF case where ffmpeg could not open the stream.

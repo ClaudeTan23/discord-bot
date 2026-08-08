@@ -105,6 +105,14 @@ def main() -> int:
         format="%(asctime)s %(levelname)-8s %(name)s: %(message)s",
     )
 
+    # discord.py streams audio from a thread that must wake every 20ms, and it
+    # sends packets back to back to catch up whenever it wakes late. yt-dlp's
+    # extraction is pure-Python and CPU-heavy (the signature/nsig interpreter),
+    # so a burst of lookups can hold the GIL well past that deadline. Checking
+    # five times as often costs a little throughput on those threads and keeps
+    # the audio thread on schedule.
+    sys.setswitchinterval(0.001)
+
     # music_player.config loads .env at import time, before it reads any
     # setting; this is a no-op safety net if that ever changes.
     load_dotenv(ENV_FILE)
