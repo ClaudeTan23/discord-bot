@@ -19,7 +19,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 logging.disable(logging.CRITICAL)
 
 import discord  # noqa: E402
-from unittest.mock import MagicMock  # noqa: E402
+from unittest.mock import MagicMock, patch  # noqa: E402
 
 from music_player import ui  # noqa: E402
 from music_player.audio import (  # noqa: E402
@@ -1432,6 +1432,232 @@ class TestBufferedAudioSource(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(buf.is_opus())
         discord.PCMVolumeTransformer(buf, volume=0.5)
         buf.cleanup()
+
+
+class TestHelpManual(unittest.TestCase):
+    """?help must reflect edits to help.txt without restarting the bot."""
+
+    def setUp(self):
+        import tempfile
+
+        self._dir = tempfile.TemporaryDirectory()
+        self.addCleanup(self._dir.cleanup)
+        self.path = Path(self._dir.name) / "help.txt"
+
+    def _touch(self, text: str) -> None:
+        # Timestamps have coarse resolution on some filesystems, so change the
+        # size too - the stamp is (mtime, size) precisely for this reason.
+        self.path.write_text(text, encoding="utf-8")
+
+    def test_reloads_after_the_file_changes(self):
+        from music_player.help import HelpManual
+
+        self._touch("first version")
+        manual = HelpManual(self.path)
+        self.assertEqual(manual.text(), "first version")
+
+        self._touch("second version, longer")
+        self.assertEqual(manual.text(), "second version, longer")
+
+    def test_unchanged_file_is_not_read_again(self):
+        from music_player.help import HelpManual
+
+        self._touch("stable text")
+        manual = HelpManual(self.path)
+
+        calls = []
+        original = Path.read_text
+
+        def counted(self_, *a, **kw):
+            calls.append(self_)
+            return original(self_, *a, **kw)
+
+        with patch.object(Path, "read_text", counted):
+            for _ in range(5):
+                self.assertEqual(manual.text(), "stable text")
+        self.assertEqual(calls, [], "a stat() should be enough when nothing changed")
+
+    def test_missing_file_falls_back_and_recovers(self):
+        from music_player.help import HelpManual
+
+        manual = HelpManual(self.path)  # never created
+        self.assertEqual(manual.text(), HelpManual.FALLBACK)
+
+        self._touch("now it exists")
+        self.assertEqual(manual.text(), "now it exists")
+
+    def test_blank_save_keeps_the_previous_text(self):
+        from music_player.help import HelpManual
+
+        self._touch("real content")
+        manual = HelpManual(self.path)
+
+        self._touch("   \n  ")  # caught mid-edit
+        self.assertEqual(manual.text(), "real content")
+
+    def test_shipped_manual_fits_in_an_embed(self):
+        from music_player.config import HELP_FILE
+
+        text = HELP_FILE.read_text(encoding="utf-8")
+        self.assertLessEqual(len(text), 4096, "Discord truncates past 4096 chars")
+        self.assertTrue(text.strip())
+
+    def test_sections_are_reparsed_on_reload(self):
+        from music_player.help import HelpManual
+
+        self._touch("intro\n\n**One**\nbody one")
+        manual = HelpManual(self.path)
+        self.assertEqual([s.name for s in manual.sections()], ["One"])
+
+        self._touch("intro\n\n**One**\nbody one\n\n**Two**\nbody two")
+        self.assertEqual([s.name for s in manual.sections()], ["One", "Two"])
+
+
+class TestHelpParsing(unittest.TestCase):
+    """help.txt drives the dropdown, so its headings must parse predictably."""
+
+    def test_intro_and_sections_are_separated(self):
+        from music_player.help import parse
+
+        intro, sections = parse(
+            "Read me first.\n\n**Playback**\n- ?play\n\n**Queue**\n- ?queue\n"
+        )
+        self.assertEqual(intro, "Read me first.")
+        self.assertEqual([s.name for s in sections], ["Playback", "Queue"])
+        self.assertEqual(sections[0].body, "- ?play")
+
+    def test_a_line_that_merely_starts_bold_is_content(self):
+        """`**?help** - display this list` is an entry, not a new category."""
+        from music_player.help import parse
+
+        _, sections = parse("**Start**\n**`?help`** — Display this list.\n")
+        self.assertEqual([s.name for s in sections], ["Start"])
+        self.assertIn("?help", sections[0].body)
+
+    def test_a_file_without_headings_renders_whole(self):
+        from music_player.help import parse
+
+        intro, sections = parse("just a flat list of commands")
+        self.assertEqual(intro, "")
+        self.assertEqual(len(sections), 1)
+        self.assertEqual(sections[0].body, "just a flat list of commands")
+
+    def test_empty_sections_are_dropped(self):
+        from music_player.help import parse
+
+        _, sections = parse("**Empty**\n\n**Real**\ncontent")
+        self.assertEqual([s.name for s in sections], ["Real"])
+
+    def test_shipped_manual_parses_into_categories(self):
+        from music_player.config import HELP_FILE
+        from music_player.help import build_embed, parse
+
+        intro, sections = parse(HELP_FILE.read_text(encoding="utf-8"))
+        self.assertTrue(intro, "the lead paragraph should stay out of the sections")
+        self.assertGreaterEqual(len(sections), 2)
+        self.assertLessEqual(len(sections), 25, "Discord allows 25 select options")
+        for section in sections:
+            self.assertLessEqual(len(section.name), 100, section.name)
+            self.assertLessEqual(len(build_embed(section).description), 4096)
+
+
+class TestHelpView(unittest.IsolatedAsyncioTestCase):
+    """The dropdown must answer only its owner and fail visibly, not silently."""
+
+    MANUAL = "Lead line.\n\n**One**\nbody one\n\n**Two**\nbody two"
+
+    def _manual(self, text=None):
+        import tempfile
+
+        from music_player.help import HelpManual
+
+        d = tempfile.TemporaryDirectory()
+        self.addCleanup(d.cleanup)
+        path = Path(d.name) / "help.txt"
+        path.write_text(text or self.MANUAL, encoding="utf-8")
+        return HelpManual(path)
+
+    async def test_one_option_per_section(self):
+        from music_player.help import HelpView
+
+        view = HelpView(self._manual(), user_id=7)
+        select = view.children[0]
+        self.assertEqual([o.label for o in select.options], ["One", "Two"])
+
+    async def test_landing_page_carries_the_intro(self):
+        from music_player.help import HelpView
+
+        view = HelpView(self._manual(), user_id=7)
+        self.assertEqual(view.landing.title, "One")
+        self.assertIn("Lead line.", view.landing.description)
+        self.assertIn("body one", view.landing.description)
+
+    async def test_a_single_section_gets_no_dropdown(self):
+        from music_player.help import HelpView
+
+        view = HelpView(self._manual("flat text, no headings"), user_id=7)
+        self.assertEqual(view.children, [], "nothing to choose between")
+
+    async def test_choosing_swaps_the_page(self):
+        from unittest.mock import AsyncMock
+
+        from music_player.help import HelpView
+
+        view = HelpView(self._manual(), user_id=7)
+        # Select.values reads a ContextVar set during a real interaction and
+        # falls back to _values; the fallback is what a unit test can drive.
+        view.children[0]._values = ["1"]
+        interaction = MagicMock()
+        interaction.response.edit_message = AsyncMock()
+
+        await view.children[0].callback(interaction)
+
+        embed = interaction.response.edit_message.await_args.kwargs["embed"]
+        self.assertEqual(embed.title, "Two")
+        self.assertEqual(embed.description, "body two")
+        self.assertNotIn("Lead line.", embed.description)
+
+    async def test_another_user_is_turned_away(self):
+        from unittest.mock import AsyncMock
+
+        from music_player.help import HelpView
+
+        view = HelpView(self._manual(), user_id=7)
+        interaction = MagicMock()
+        interaction.user.id = 999
+        interaction.response.send_message = AsyncMock()
+
+        self.assertFalse(await view.interaction_check(interaction))
+        self.assertTrue(interaction.response.send_message.await_args.kwargs["ephemeral"])
+
+    async def test_owner_is_let_through(self):
+        from music_player.help import HelpView
+
+        view = HelpView(self._manual(), user_id=7)
+        interaction = MagicMock()
+        interaction.user.id = 7
+        self.assertTrue(await view.interaction_check(interaction))
+
+    async def test_timeout_disables_the_menu(self):
+        from unittest.mock import AsyncMock
+
+        from music_player.help import HelpView
+
+        view = HelpView(self._manual(), user_id=7)
+        view.message = MagicMock()
+        view.message.edit = AsyncMock()
+
+        await view.on_timeout()
+
+        self.assertTrue(view.children[0].disabled)
+        view.message.edit.assert_awaited_once()
+
+    async def test_timeout_without_a_message_is_harmless(self):
+        from music_player.help import HelpView
+
+        view = HelpView(self._manual(), user_id=7)
+        await view.on_timeout()  # must not raise
+        self.assertTrue(view.children[0].disabled)
 
 
 if __name__ == "__main__":

@@ -1,16 +1,40 @@
-- **`?add`** ***"Youtube url/link"***  support youtube playlist as well 
-- **`?join`** ***"Voice channel ID"***  join the voice channel 
-- **`?leave`**  Leave the joined voice channel 
-- **`?play`**  Play the songs/musics in the voice channel
-- **`?pause`**  Pause the playing song in the voice channel
-- **`?resume`**  Resuming the paused song in the voice channel
-- **`?skip`**  Skip to the next song/music
-- **`?skipto`** ***"Number of the song in the queue"***  Skip to the chosen number in the queue
-- **`?queue`**  Display queued songs/musics
-- **`?queueto`** ***"Number of the page in the queue"***  Display the chosen page of the queued songs/musics
-- **`?clear`**  Clear the queue
-- **`?volume`** ***"Number of 0 to 100"***  Set the volume for the player
-- **`?stop`**  Stop playing, leave joined voice channel and clear the queue
-- **`?help`**  Display all commands and manuals
+All commands work two ways: type **`?command`** in any text channel, or use the slash command **`/command`**. Slash commands are easier — they show you the options as you type.
 
-**Noted: Also work the same for Slash Commands "/" as well.**
+**Getting started**
+- **1.** Join a voice channel yourself, then run **`/join`** and pick that channel from the list.
+- **2.** Run **`?add`** with a YouTube link to put a song in the queue.
+  `?add https://www.youtube.com/watch?v=dQw4w9WgXcQ`
+- **3.** Run **`?play`**. The first song in the queue starts.
+
+Add as many links as you like, before or during playback. They line up in a **queue** and play in order.
+Run **`?help`** at any time to see this list again.
+
+**Voice channel**
+- **`?join`** ***<voice channel>*** — Brings the bot into a voice channel. Use **`/join`** and pick from the list; **`?join`** needs the channel's ID, which is harder to find.
+- **`?leave`** — The bot disconnects but remembers the queue. Run **`?join`** again to carry on where you left off.
+- **`?stop`** — Stops the music, disconnects, and empties the queue.
+
+**Playback**
+- **`?add`** ***<YouTube link>*** — Adds a song to the end of the queue. Paste a **playlist** link and every song in it is added at once.
+- **`?play`** — Starts playing from the top of the queue.
+- **`?pause`** — Pauses the music. **`?resume`** continues from the exact same spot.
+- **`?skip`** — Jumps to the next song in the queue.
+- **`?skipto`** ***<number>*** — Jumps straight to a song further down the queue. Run **`?queue`** first to see the numbers.
+  `?skipto 5`
+
+**Queue**
+The queue is the list of songs waiting to play, in order. Everyone in the server shares the same one.
+- **`?queue`** — Shows the first 10 songs. The song playing right now is marked *(Playing)*.
+- **`?queueto`** ***<page>*** — Shows a later page of the queue, 10 songs per page.
+  `?queueto 3`
+- **`?clear`** — Empties the queue. The song playing right now is not interrupted.
+
+**Volume**
+- **`?volume`** ***<0 to 100>*** — Sets how loud the bot plays for everyone. It starts at **10**, and the change is heard straight away — no need to restart the song.
+  `?volume 25`
+
+**Notes**
+- The bot leaves on its own after about a minute with nothing playing, so it does not sit in your channel all day.
+- Songs that are private, deleted, or blocked in your country are skipped automatically, and the bot tells you which ones.
+- If a song fails to load, it is tried once more on a fresh link before being skipped.
+- Adding many links quickly may get you a short "slow down" message. Nothing is lost — wait a few seconds and try again.

@@ -14,6 +14,7 @@ from dotenv import load_dotenv
 
 from music_player import ui
 from music_player.config import COMMAND_PREFIX, ENV_FILE, HELP_FILE
+from music_player.help import HelpManual, send_manual
 from music_player.join_channel import JoinChannel
 from music_player.leave_channel import LeaveChannel
 from music_player.player import Player
@@ -21,15 +22,6 @@ from music_player.state import MusicState
 from music_player.ytdl import YouTubeService
 
 log = logging.getLogger("music_bot")
-
-
-def _load_help_text() -> str:
-    """Read the help manual once at startup rather than on every invocation."""
-    try:
-        return HELP_FILE.read_text(encoding="utf-8")
-    except OSError:
-        log.exception("could not read help file at %s", HELP_FILE)
-        return "Help manual is unavailable."
 
 
 class MusicBot(commands.Bot):
@@ -48,7 +40,7 @@ class MusicBot(commands.Bot):
         )
         self.music_state = MusicState()
         self.youtube = YouTubeService()
-        self.help_text = _load_help_text()
+        self.help_manual = HelpManual(HELP_FILE)
 
     async def setup_hook(self) -> None:
         """Register cogs exactly once.
@@ -91,12 +83,7 @@ bot = MusicBot()
 
 @bot.hybrid_command(name="help", description="Display all the commands and manuals")
 async def help_command(ctx: commands.Context) -> None:
-    embed = discord.Embed(
-        colour=discord.Colour.dark_grey(),
-        description=ctx.bot.help_text,
-        title="All commands and manuals",
-    )
-    await ctx.send(embed=embed)
+    await send_manual(ctx, ctx.bot.help_manual)
 
 
 def main() -> int:
