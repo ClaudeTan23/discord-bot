@@ -185,6 +185,38 @@ def is_youtube_url(url: str) -> bool:
     return parsed.path.startswith(_PLAYABLE_PATH_PREFIXES)
 
 
+def video_id(url: str) -> Optional[str]:
+    """The YouTube video id in ``url``, or ``None`` if there isn't one.
+
+    Pure string work, no network. Lets a caller derive artwork for a queued
+    track without paying for an extraction per song just to draw a list.
+
+    Anything that is not exactly an 11-character id comes back ``None`` rather
+    than a guess - a wrong id would render as a broken image.
+    """
+    parsed = urlparse(url)
+    host = (parsed.hostname or "").lower()
+
+    if host in _YOUTUBE_SHORT_HOSTS:
+        candidate = parsed.path.lstrip("/").split("/")[0]
+    elif host == "youtube.com" or host.endswith(".youtube.com"):
+        ids = parse_qs(parsed.query).get("v")
+        if ids and ids[0]:
+            candidate = ids[0]
+        else:
+            # /shorts/<id>, /embed/<id>, /live/<id>, /v/<id>
+            parts = [part for part in parsed.path.split("/") if part]
+            candidate = (
+                parts[1]
+                if len(parts) >= 2 and f"/{parts[0]}/" in _PLAYABLE_PATH_PREFIXES
+                else ""
+            )
+    else:
+        return None
+
+    return candidate if len(candidate) == YOUTUBE_ID_LENGTH else None
+
+
 def is_complete_query(url: str) -> bool:
     """As :func:`is_youtube_url`, but also rejects a half-typed video id."""
     if not is_youtube_url(url):

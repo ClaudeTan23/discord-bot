@@ -24,9 +24,10 @@ class LeaveChannel(commands.Cog):
         state = self.state.get(ctx.guild.id)
 
         if not state.connected:
-            await ctx.send(embed=ui.error("Did not join any voice channel."))
+            await ctx.send(embed=ui.notice("👍  **I'm not in a voice channel.**"))
             return
 
         state.suppress_advance = True
+        await state.retire_controls()
         await state.disconnect()
-        await ctx.send(embed=ui.success(":white_check_mark: Have leave the voice channel."))
+        await ctx.send(embed=ui.left())

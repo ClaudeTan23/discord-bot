@@ -112,13 +112,37 @@ PLAYBACK_FAILURE_SECONDS = 5.0
 #: stream failure worth one retry rather than a song that finished.
 MIN_PLAYED_FRACTION = 0.5
 
-NOW_PLAYING_ICON = (
-    "https://encrypted-tbn0.gstatic.com/images"
-    "?q=tbn:ANd9GcST8wdNfmD5TMIpIQ71p2O1MiBx2GFS8M9NzyHFsmyplw&s"
-)
 FALLBACK_AVATAR = (
     "https://lisboaparapessoas.pt/wp-content/uploads/2022/02/discordlxparapessoas.png"
 )
+
+# -- embed design -----------------------------------------------------------
+#
+# One colour per *meaning*, not per command, so a user learns the palette once:
+# blurple = audio is running, yellow = held, green = it worked, red = it did
+# not, grey = neutral information. These are Discord's own accent values, so
+# the embeds sit in the client's palette instead of fighting it.
+COLOUR_PLAYING = 0x5865F2
+COLOUR_PAUSED = 0xFEE75C
+COLOUR_SUCCESS = 0x57F287
+COLOUR_ERROR = 0xED4245
+#: Deliberately *not* Discord's embed background (0x2B2D31): an accent rail in
+#: that colour is invisible in dark mode. This is the muted grey Discord uses
+#: for secondary text, which reads on both the dark and light embed surface.
+COLOUR_NEUTRAL = 0x80848E
+COLOUR_QUEUED = 0xEB459E
+
+#: Segments in the ``▰▰▰▱▱▱`` progress bar. Block characters are used rather
+#: than an emoji knob so the bar keeps its width in every client font.
+PROGRESS_BAR_WIDTH = 14
+
+#: How long the buttons under a Now Playing message stay live. Discord keeps
+#: the message forever, so the view is greyed out at this point rather than
+#: leaving controls that fail silently when the bot restarts.
+CONTROLS_TIMEOUT = 900.0
+#: Queue pagination is browsed in one sitting; a short timeout keeps the bot
+#: from holding thousands of views for messages nobody is reading.
+QUEUE_VIEW_TIMEOUT = 180.0
 
 
 _FFMPEG_NAMES = ("ffmpeg.exe", "ffmpeg")

@@ -28,7 +28,12 @@ class JoinChannel(commands.Cog):
     async def join(self, ctx: commands.Context, channel: str) -> None:
         target = self._resolve_channel(ctx, channel)
         if target is None:
-            await ctx.send(embed=ui.error("Invalid voice channel."))
+            await ctx.send(
+                embed=ui.error(
+                    "**I couldn't find that voice channel.**\n"
+                    "Use **`/join`** and pick one from the list."
+                )
+            )
             return
 
         state = self.state.get(ctx.guild.id)
@@ -42,44 +47,32 @@ class JoinChannel(commands.Cog):
             if not state.connected:
                 state.voice = await target.connect()
                 state.schedule_idle_disconnect()
-                await ctx.send(
-                    embed=ui.success(
-                        f":white_check_mark: Joined **`{target.name}`** voice channel."
-                    )
-                )
+                await ctx.send(embed=ui.joined(target.name))
                 return
 
             if state.voice.channel.id == target.id:
                 await ctx.send(
-                    embed=ui.error("The selected voice channel had already connected.")
+                    embed=ui.notice(f"👍  **I'm already in {target.name}.**")
                 )
                 return
 
             was_playing = state.playing
             if was_playing:
                 state.voice.pause()
+                state.mark_paused()
                 state.suppress_advance = True
 
             await state.voice.move_to(target)
             state.schedule_idle_disconnect()
-
-            if was_playing:
-                await ctx.send(
-                    embed=ui.success(
-                        f":white_check_mark: Paused audio and move to "
-                        f"**`{target.name}`** voice channel."
-                    )
-                )
-            else:
-                await ctx.send(
-                    embed=ui.success(
-                        f":white_check_mark: Have move to **`{target.name}`** "
-                        f"voice channel."
-                    )
-                )
+            await ctx.send(embed=ui.moved(target.name, was_playing=was_playing))
         except discord.ClientException:
             log.exception("voice connect failed in guild %s", ctx.guild.id)
-            await ctx.send(embed=ui.error("Could not connect to that voice channel."))
+            await ctx.send(
+                embed=ui.error(
+                    f"**I couldn't connect to {target.name}.**\n"
+                    "Check I'm allowed to join it, then try again."
+                )
+            )
         except Exception:
             log.exception("unexpected join failure in guild %s", ctx.guild.id)
             await ctx.send(embed=ui.generic_error())
@@ -110,7 +103,11 @@ class JoinChannel(commands.Cog):
     async def join_error(self, ctx: commands.Context, error: Exception) -> None:
         if isinstance(error, commands.MissingRequiredArgument):
             await ctx.send(
-                embed=ui.error("Missing required **`option/argument`** in the command.")
+                embed=ui.error(
+                    "**Which channel?**\n"
+                    "Use **`/join`** and pick one from the list — it's easier "
+                    "than finding the channel ID for **`?join`**."
+                )
             )
         else:
             log.error("join command error: %s", error)
