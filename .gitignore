@@ -8,3 +8,7 @@ __pycache__/
 .env
 *.env
 !.env.example
+
+# Runtime logs (logs/YYYY/MM/DD/). Credentials are redacted before they are
+# written, but there is still no reason to commit them.
+/logs

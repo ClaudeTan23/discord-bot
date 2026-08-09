@@ -21,6 +21,24 @@ load_dotenv(ENV_FILE)
 COMMAND_PREFIX = "?"
 HELP_FILE = PROJECT_ROOT / "src" / "help.txt"
 
+# -- logging ----------------------------------------------------------------
+#: Root of the log tree. Each day gets its own folder underneath, so finding
+#: "what happened on the 3rd" is opening a folder rather than reading filename
+#: suffixes. Override with LOG_DIR.
+LOG_DIR = Path(os.environ.get("LOG_DIR", "").strip() or (PROJECT_ROOT / "logs"))
+#: Verbosity of both the console and the day's ``bot.log``. DEBUG is genuinely
+#: useful here - it carries the queue-supersede and cache-hit decisions that
+#: explain most "why did it skip that song" reports. Override with LOG_LEVEL.
+LOG_LEVEL = os.environ.get("LOG_LEVEL", "INFO").strip().upper() or "INFO"
+#: Day folders older than this are deleted at startup. 0 keeps everything.
+LOG_RETENTION_DAYS = max(0, int(os.environ.get("LOG_RETENTION_DAYS", "14")))
+#: A single file is capped so one runaway error loop cannot fill the disk; the
+#: day continues in ``bot.2.log``, ``bot.3.log`` and so on.
+LOG_MAX_BYTES = max(0, int(os.environ.get("LOG_MAX_BYTES", str(10 * 1024 * 1024))))
+#: discord.py logs every gateway heartbeat at INFO, which buries our own
+#: records. Its warnings still come through.
+LOG_DISCORD_LEVEL = os.environ.get("LOG_DISCORD_LEVEL", "WARNING").strip().upper()
+
 #: Volume applied to a guild that has never used ``?volume``.
 DEFAULT_VOLUME = 0.10
 #: Idle time before the bot leaves a voice channel on its own.

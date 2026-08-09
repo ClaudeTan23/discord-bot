@@ -225,7 +225,10 @@ def clip(title: str, limit: int = TITLE_LIMIT) -> str:
     if len(title) <= limit:
         return title
 
-    clipped = title[:limit].rstrip()
+    # The ellipsis has to fit *inside* the budget. Slicing at the limit and
+    # then appending returns limit+1 characters, which Discord rejects
+    # outright at the 256-character embed title ceiling.
+    clipped = title[: limit - 1].rstrip()
     # A cut landing inside "[Remastered in 4K]" leaves an unmatched bracket,
     # which breaks the [label](url) link the title sits inside. Back up past
     # the opener rather than emit markup Discord will render as raw text.
@@ -236,7 +239,7 @@ def clip(title: str, limit: int = TITLE_LIMIT) -> str:
     # Everything up to the limit was one long bracketed run; a hard cut beats
     # an empty label.
     if not clipped:
-        clipped = title[:limit].rstrip()
+        clipped = title[: limit - 1].rstrip()
     return clipped + "…"
 
 
