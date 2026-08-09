@@ -14,6 +14,7 @@ from discord.ext import commands
 
 from music_player import ui
 from music_player.audio import BufferedAudioSource
+from music_player.controls import PlayerControls, QueuePages
 from music_player.config import (
     ADD_PER,
     ADD_RATE,
@@ -185,7 +186,8 @@ class Player(commands.Cog):
         if unavailable:
             await destination.send(
                 embed=ui.error(
-                    f"{ui.track_link(track)} is not available, skip to next song."
+                    f"**Couldn't play {ui.track_link(track)}** — it's "
+                    "unavailable. Moving to the next song."
                 )
             )
             await self._advance(channel, state, forced=forced, expect=track)
@@ -233,7 +235,7 @@ class Player(commands.Cog):
             # ?volume can adjust it live. The buffer sits underneath it, so a
             # volume change applies to the next frame out rather than to audio
             # queued seconds ago.
-            state.playback_started = time.monotonic()
+            state.mark_started()
             state.voice.play(
                 discord.PCMVolumeTransformer(source, volume=state.volume),
                 after=lambda err: self._on_track_end(err, channel, state, track),
@@ -251,21 +253,49 @@ class Player(commands.Cog):
         if len(state.queue) > 1:
             self.youtube.prefetch_stream(state.queue[1].url)
 
+        # The previous track's buttons refer to a song that is no longer on
+        # air; grey them out before posting the ones that replace them.
+        await state.retire_controls()
+
         user = await self._fetch_requester(channel, track)
-        await destination.send(
-            embed=ui.now_playing(
-                title=stream.title,
-                url=track.url,
-                duration=stream.duration or track.duration,
-                thumbnail=stream.thumbnail,
-                user=user,
+        snapshot = self._snapshot(state, stream, track, user)
+        view = PlayerControls(self, state, snapshot)
+        try:
+            view.message = await destination.send(
+                embed=ui.now_playing(snapshot), view=view
             )
-        )
+            state.controls = view
+        except discord.HTTPException:
+            # The song is playing either way - a missing announcement must not
+            # take the audio down with it.
+            log.warning("could not post the now playing message", exc_info=True)
         return True
+
+    @staticmethod
+    def _snapshot(
+        state: GuildState,
+        stream: StreamInfo,
+        track: Track,
+        user: Optional[discord.abc.User],
+    ) -> ui.NowPlaying:
+        """Freeze everything the Now Playing embed needs into one value."""
+        return ui.NowPlaying(
+            title=stream.title,
+            url=track.url,
+            duration=stream.duration or track.duration,
+            thumbnail=stream.thumbnail,
+            requester=user,
+            volume=state.volume,
+            # The playing track is always the head of the queue.
+            position=1,
+            total=len(state.queue),
+            up_next=state.queue[1] if len(state.queue) > 1 else None,
+            remaining=ui.total_duration(state.queue),
+        )
 
     async def _fetch_requester(
         self, channel: discord.abc.Messageable, track: Track
-    ) -> discord.abc.User:
+    ) -> Optional[discord.abc.User]:
         """Resolve the requesting member, falling back to the cache."""
         guild = getattr(channel, "guild", None)
         if guild is not None:
@@ -334,8 +364,8 @@ class Player(commands.Cog):
         )
         await channel.send(
             embed=ui.error(
-                f"Couldn't play the audio for {ui.track_link(track)}, "
-                "skip to next song."
+                f"**Still couldn't play {ui.track_link(track)}** after a retry. "
+                "Moving to the next song."
             )
         )
         await self._advance(channel, state, forced=False, expect=track)
@@ -403,6 +433,9 @@ class Player(commands.Cog):
                 state.skip_requested = False
                 state.retried_url = None
                 state.schedule_idle_disconnect()
+                # Nothing is playing, so the controls under the last Now
+                # Playing message have nothing left to control.
+                await state.retire_controls()
                 await channel.send(embed=ui.all_played())
         except Exception:
             log.exception("failed to advance queue in guild %s", state.guild_id)
@@ -416,12 +449,13 @@ class Player(commands.Cog):
         state = self.state.get(ctx.guild.id)
 
         if state.playing:
-            await ctx.send(embed=ui.notice("Is playing right now."))
+            await ctx.send(embed=ui.notice("▶  **Already playing.**"))
             return
         if state.paused:
             await ctx.send(
                 embed=ui.notice(
-                    "The song is paused, use **`?resume`** command to resume playing."
+                    "⏸  **That song is paused.**\nUse **`?resume`** to pick it "
+                    "back up."
                 )
             )
             return
@@ -432,9 +466,7 @@ class Player(commands.Cog):
             await ctx.send(embed=ui.not_in_voice())
             return
         if not state.queue:
-            await ctx.send(
-                embed=ui.error("Didn't have any songs in playlist/queue to play.")
-            )
+            await ctx.send(embed=ui.empty_queue())
             return
 
         state.skip_requested = False
@@ -447,10 +479,10 @@ class Player(commands.Cog):
         if not responded:
             # A deferred interaction must never be left unanswered.
             if state.playing:
-                await ctx.send(embed=ui.notice("Is playing right now."))
+                await ctx.send(embed=ui.notice("▶  **Already playing.**"))
             else:
                 await ctx.send(
-                    embed=ui.notice("Another command is already starting playback.")
+                    embed=ui.notice("⏳  **Starting up** — another request got here first.")
                 )
 
     @commands.hybrid_command(name="add", description="Add music by using youtube link/URL")
@@ -485,11 +517,26 @@ class Player(commands.Cog):
                 for entry in result.entries
             ]
             state.queue.extend(tracks)
+
+            # Where these landed, and how long until the first is heard. A
+            # countdown is only offered while audio is actually advancing -
+            # a paused or idle queue would make it a guess.
+            first_index = len(state.queue) - len(tracks)
+            starts_in = None
+            if state.playing:
+                ahead = ui.total_duration(state.queue[:first_index])
+                starts_in = max(0, ahead - int(state.elapsed))
+
             await ctx.send(
                 embed=ui.added(
                     tracks[0],
                     extra_count=len(tracks) - 1,
                     unavailable=result.unavailable,
+                    playlist_title=result.playlist_title,
+                    playlist_url=normalize_url(url) if result.is_playlist else None,
+                    total_seconds=ui.total_duration(tracks),
+                    position=first_index + 1,
+                    starts_in=starts_in,
                 )
             )
 
@@ -524,53 +571,51 @@ class Player(commands.Cog):
 
         return [app_commands.Choice(name=label[:_CHOICE_LIMIT], value=value)]
 
-    @commands.hybrid_command(name="queue", description="Display the queued songs.")
+    @commands.hybrid_command(name="queue", description="Show the songs waiting to play")
     @commands.cooldown(QUEUE_RATE, QUEUE_PER, commands.BucketType.user)
     async def queue(self, ctx: commands.Context) -> None:
         state = self.state.get(ctx.guild.id)
         if not state.queue:
             await ctx.send(embed=ui.empty_queue())
             return
-        await ctx.send(
-            embed=ui.queue_page(state.queue, 1, status=self._status_marker(state))
-        )
+        view = QueuePages(self, state, user_id=ctx.author.id)
+        view.message = await ctx.send(embed=view.render(), view=view)
 
-    @commands.hybrid_group(fallback="page", description="Fetch the queue page")
+    @commands.hybrid_group(fallback="page", description="Jump to a page of the queue")
     @app_commands.describe(number="The number of the page")
     @commands.cooldown(QUEUE_RATE, QUEUE_PER, commands.BucketType.user)
     async def queueto(self, ctx: commands.Context, number: int) -> None:
         state = self.state.get(ctx.guild.id)
         if not state.queue:
-            await ctx.send(embed=ui.error("Doesn't have any song in the queue."))
+            await ctx.send(embed=ui.empty_queue())
             return
 
         pages = ui.total_pages(len(state.queue), QUEUE_PAGE_SIZE)
         if not 1 <= number <= pages:
-            await ctx.send(embed=ui.error("The queue page does not exist."))
+            await ctx.send(embed=ui.no_such_page(number, pages))
             return
 
-        await ctx.send(
-            embed=ui.queue_page(state.queue, number, status=self._status_marker(state))
-        )
+        view = QueuePages(self, state, user_id=ctx.author.id, page=number)
+        view.message = await ctx.send(embed=view.render(), view=view)
 
-    @commands.hybrid_group(
-        fallback="queue", description="Clear the music/song in the queue"
-    )
+    @commands.hybrid_group(fallback="queue", description="Empty the queue")
     async def clear(self, ctx: commands.Context) -> None:
         state = self.state.get(ctx.guild.id)
         if not state.queue:
             await ctx.send(embed=ui.empty_queue())
             return
 
-        if state.connected and (state.playing or state.paused):
+        kept_playing = state.connected and (state.playing or state.paused)
+        if kept_playing:
             # Keep the track that is currently on air.
             del state.queue[1:]
         else:
             state.queue.clear()
 
-        await ctx.send(embed=ui.success("Playlist/queue have been cleared."))
+        await ctx.send(embed=ui.cleared(kept_playing))
+        await self._repaint(state)
 
-    @commands.hybrid_command(name="skip", description="Skip to the next songs")
+    @commands.hybrid_command(name="skip", description="Skip to the next song")
     async def skip(self, ctx: commands.Context) -> None:
         state = self.state.get(ctx.guild.id)
         if not state.queue:
@@ -580,9 +625,10 @@ class Player(commands.Cog):
             await ctx.send(embed=ui.not_in_voice())
             return
 
-        await self._skip_to_head(ctx, state)
+        await ctx.send(embed=ui.skipped(state.current))
+        await self.perform_skip(ctx.channel, state)
 
-    @commands.hybrid_command(name="skipto", description="Skip to chosen songs")
+    @commands.hybrid_command(name="skipto", description="Jump to a song further down")
     @app_commands.describe(number="The number of the song in the queue")
     async def skipto(self, ctx: commands.Context, number: int) -> None:
         state = self.state.get(ctx.guild.id)
@@ -590,74 +636,71 @@ class Player(commands.Cog):
             await ctx.send(embed=ui.empty_queue())
             return
         if not 1 <= number <= len(state.queue):
-            await ctx.send(embed=ui.error("The number of the song does not exist."))
+            await ctx.send(embed=ui.no_such_song(number, len(state.queue)))
             return
         if not state.connected:
             await ctx.send(embed=ui.not_in_voice())
             return
 
+        target = state.queue[number - 1]
         # Drop everything before the target; _advance pops the final one.
         del state.queue[: max(0, number - 2)]
-        await self._skip_to_head(ctx, state)
+        await ctx.send(embed=ui.jumping_to(target))
+        await self.perform_skip(ctx.channel, state)
 
-    async def _skip_to_head(self, ctx: commands.Context, state: GuildState) -> None:
-        # Pin the track we are skipping past, so two users pressing ?skip at
-        # the same moment advance one song between them, not two.
-        skipping = state.current
-        state.skip_requested = True
-        state.suppress_advance = False
-        state.voice.stop()
-        await ctx.send(
-            embed=Embed(
-                colour=discord.Colour.dark_gold(),
-                description="Skip to the next songs.",
-            )
-        )
-        await self._advance(ctx.channel, state, forced=True, expect=skipping)
-
-    @commands.hybrid_command(
-        name="pause", description="Pause current playing audio in voice channel"
-    )
+    @commands.hybrid_command(name="pause", description="Pause the current song")
     async def pause(self, ctx: commands.Context) -> None:
         state = self.state.get(ctx.guild.id)
         if not state.connected:
             await ctx.send(embed=ui.not_in_voice())
             return
 
-        if state.playing:
-            state.voice.pause()
-            state.suppress_advance = True
-            state.schedule_idle_disconnect()
-            await ctx.send(embed=ui.success(":white_check_mark: Song have been paused."))
+        if self.apply_pause(state):
+            await ctx.send(embed=ui.paused())
+            await self._repaint(state)
         elif state.paused:
-            await ctx.send(embed=ui.success("The song had already paused."))
+            await ctx.send(embed=ui.notice("⏸  **Already paused.**"))
         else:
-            await ctx.send(embed=ui.error("There's no music playing."))
+            await ctx.send(embed=ui.nothing_playing())
 
-    @commands.hybrid_command(
-        name="resume", description="Resume the paused audio in voice channel"
-    )
+    @commands.hybrid_command(name="resume", description="Resume the paused song")
     async def resume(self, ctx: commands.Context) -> None:
         state = self.state.get(ctx.guild.id)
         if not state.connected:
             await ctx.send(embed=ui.not_in_voice())
             return
 
-        if state.playing:
-            await ctx.send(embed=ui.notice("Is playing right now."))
-        elif state.paused:
-            state.voice.resume()
-            state.suppress_advance = False
-            state.cancel_idle_disconnect()
-            await ctx.send(embed=ui.notice("Resuming the paused song."))
+        if self.apply_resume(state):
+            await ctx.send(embed=ui.resumed())
+            await self._repaint(state)
+        elif state.playing:
+            await ctx.send(embed=ui.notice("▶  **Already playing.**"))
         else:
-            await ctx.send(embed=ui.error("There's no music playing."))
+            await ctx.send(embed=ui.nothing_playing())
 
-    @commands.hybrid_command(name="volume", description="Set the volume for the player")
+    @commands.hybrid_command(name="nowplaying", description="Show what's playing now")
+    async def nowplaying(self, ctx: commands.Context) -> None:
+        """The progress bar's real home.
+
+        The Now Playing announcement is a snapshot from the moment a song
+        started; this is the one that answers "how much of this is left".
+        """
+        state = self.state.get(ctx.guild.id)
+        embed = self._current_embed(state)
+        if embed is None:
+            await ctx.send(embed=ui.nothing_playing())
+            return
+        await ctx.send(embed=embed)
+
+    @commands.hybrid_command(name="volume", description="Set the playback volume")
     @app_commands.describe(number="0 to 100")
     async def volume(self, ctx: commands.Context, number: int) -> None:
         if not 0 <= number <= 100:
-            await ctx.send(embed=ui.error("Please choose 0 to 100 to set the volume."))
+            await ctx.send(
+                embed=ui.error(
+                    "**Volume goes from 0 to 100.**\nTry **`?volume 25`**."
+                )
+            )
             return
 
         state = self.state.get(ctx.guild.id)
@@ -667,35 +710,115 @@ class Player(commands.Cog):
         if isinstance(source, discord.PCMVolumeTransformer):
             source.volume = state.volume
 
-        await ctx.send(embed=ui.success(f"Volume have set to **`{number}%`**."))
+        await ctx.send(embed=ui.volume_set(number))
+        await self._repaint(state)
 
     @commands.hybrid_command(
-        name="stop",
-        description="Stop playing, leave voice channel and clear the playlist/queue",
+        name="stop", description="Stop, clear the queue and leave the channel"
     )
     async def stop(self, ctx: commands.Context) -> None:
         state = self.state.get(ctx.guild.id)
         state.suppress_advance = True
+        await state.retire_controls()
         await state.disconnect()
         state.reset()
-        await ctx.send(
-            embed=ui.success(
-                ":white_check_mark: Stop playing, leaving voice channel and "
-                "queue have been cleared."
-            )
-        )
+        await ctx.send(embed=ui.stopped())
+
+    # ------------------------------------------------------------------
+    # shared actions - the commands above and the buttons in ``controls``
+    # both route through these, so a press and a command cannot drift apart
+    # ------------------------------------------------------------------
+
+    def apply_pause(self, state: GuildState) -> bool:
+        """Pause playback. Returns False when there was nothing to pause."""
+        if not state.playing:
+            return False
+        state.voice.pause()
+        state.mark_paused()
+        state.suppress_advance = True
+        state.schedule_idle_disconnect()
+        return True
+
+    def apply_resume(self, state: GuildState) -> bool:
+        """Resume playback. Returns False when nothing was paused."""
+        if not state.paused:
+            return False
+        state.voice.resume()
+        state.mark_resumed()
+        state.suppress_advance = False
+        state.cancel_idle_disconnect()
+        return True
+
+    async def perform_skip(
+        self, channel: discord.abc.Messageable, state: GuildState
+    ) -> None:
+        """Advance past the head of the queue and start whatever follows."""
+        # Pin the track we are skipping past, so two users skipping at the same
+        # moment advance one song between them, not two.
+        skipping = state.current
+        state.skip_requested = True
+        state.suppress_advance = False
+        await state.retire_controls()
+        if state.connected:
+            state.voice.stop()
+        await self._advance(channel, state, forced=True, expect=skipping)
+
+    @staticmethod
+    def status_marker(state: GuildState) -> str:
+        """The marker shown against the head of the queue."""
+        if state.playing:
+            return ui.PLAYING_MARKER
+        if state.paused:
+            return ui.PAUSED_MARKER
+        return ""
 
     # ------------------------------------------------------------------
     # helpers and error handling
     # ------------------------------------------------------------------
 
     @staticmethod
-    def _status_marker(state: GuildState) -> str:
-        if state.playing:
-            return "(Playing) "
-        if state.paused:
-            return "(Paused)"
-        return ""
+    async def _repaint(state: GuildState) -> None:
+        """Keep the live Now Playing message in step with a command.
+
+        Pausing from a button and pausing with ``?pause`` must leave the
+        channel looking identical, so the command path repaints the embed the
+        button path would have edited.
+        """
+        view = state.controls
+        if view is not None:
+            await view.repaint()
+
+    @staticmethod
+    def _current_embed(state: GuildState) -> Optional[Embed]:
+        """Render the current track, or ``None`` if nothing is on air."""
+        if not (state.playing or state.paused) or state.current is None:
+            return None
+
+        view = state.controls
+        if view is not None and not view.is_finished():
+            # The live view holds the resolved title and artwork.
+            return view.render()
+
+        # No view (restarted, or the controls timed out): fall back to what the
+        # queue itself knows, which is enough for a progress bar. Artwork comes
+        # off the link rather than a re-resolve.
+        track = state.current
+        return ui.now_playing(
+            ui.NowPlaying(
+                title=track.title,
+                url=track.url,
+                duration=track.duration,
+                thumbnail=ui.artwork(track.url),
+                requester=None,
+                volume=state.volume,
+                position=1,
+                total=len(state.queue),
+                up_next=state.queue[1] if len(state.queue) > 1 else None,
+                remaining=ui.total_duration(state.queue),
+                elapsed=state.elapsed,
+                paused=state.paused,
+            )
+        )
 
     @staticmethod
     async def _handle_throttle(ctx: commands.Context, error: Exception) -> bool:
@@ -703,14 +826,17 @@ class Player(commands.Cog):
         if isinstance(error, commands.CommandOnCooldown):
             await ctx.send(
                 embed=ui.notice(
-                    f"Slow down a moment - try again in "
-                    f"**`{error.retry_after:.1f}s`**."
+                    f"⏳  **Slow down a moment** — try again in "
+                    f"**{error.retry_after:.1f}s**."
                 )
             )
             return True
         if isinstance(error, commands.MaxConcurrencyReached):
             await ctx.send(
-                embed=ui.notice("Your previous **`add`** is still being processed.")
+                embed=ui.notice(
+                    "⏳  **Your last `?add` is still being processed.**\n"
+                    "Nothing's lost — give it a second."
+                )
             )
             return True
         return False
@@ -723,14 +849,15 @@ class Player(commands.Cog):
         if isinstance(error, commands.MissingRequiredArgument):
             await ctx.send(
                 embed=ui.error(
-                    f"Missing required **`{argument}/argument`** in the command."
+                    f"**This command needs a {argument}.**\n"
+                    f"For example: **`?{ctx.invoked_with} 3`**"
                 )
             )
         elif isinstance(error, (commands.BadArgument, commands.ConversionError)):
             await ctx.send(
                 embed=ui.error(
-                    f"Please use number for the required "
-                    f"**`{argument}/argument`** in the command."
+                    f"**The {argument} has to be a whole number.**\n"
+                    f"For example: **`?{ctx.invoked_with} 3`**"
                 )
             )
         else:
@@ -743,7 +870,10 @@ class Player(commands.Cog):
             return
         if isinstance(error, commands.MissingRequiredArgument):
             await ctx.send(
-                embed=ui.error("Missing required **`url/argument`** in the command.")
+                embed=ui.error(
+                    "**This command needs a YouTube link.**\n"
+                    "For example: **`?add https://youtu.be/dQw4w9WgXcQ`**"
+                )
             )
         else:
             log.error("add command error: %s", error)

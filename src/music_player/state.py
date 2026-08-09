@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from dataclasses import dataclass
 from typing import Dict, List, Optional
 
@@ -42,7 +43,10 @@ class GuildState:
         "suppress_advance",
         "starting",
         "playback_started",
+        "paused_at",
+        "paused_total",
         "retried_url",
+        "controls",
         "_idle_task",
     )
 
@@ -63,9 +67,17 @@ class GuildState:
         # track that ends far too early can be told apart from one that
         # finished. Both look identical to the voice after-callback.
         self.playback_started: float = 0.0
+        # Pause bookkeeping, so the progress bar shows time *heard* rather than
+        # time since the track started. Without it, a song paused for a minute
+        # comes back claiming it is a minute further along than it is.
+        self.paused_at: Optional[float] = None
+        self.paused_total: float = 0.0
         # The one track url already retried after a failed stream, so a URL
         # that is genuinely dead cannot loop.
         self.retried_url: Optional[str] = None
+        # The live button strip under the current Now Playing message, greyed
+        # out when this track stops being the current one.
+        self.controls = None
         self._idle_task: Optional[asyncio.Task] = None
 
     # -- connection state ---------------------------------------------------
@@ -85,6 +97,47 @@ class GuildState:
     @property
     def current(self) -> Optional[Track]:
         return self.queue[0] if self.queue else None
+
+    # -- playback position --------------------------------------------------
+
+    @property
+    def elapsed(self) -> float:
+        """Seconds of audio the channel has actually heard of this track.
+
+        Frozen while paused and net of every previous pause, so it can be
+        compared against the track's duration to draw a progress bar.
+        """
+        if not self.playback_started:
+            return 0.0
+        end = self.paused_at if self.paused_at is not None else time.monotonic()
+        return max(0.0, end - self.playback_started - self.paused_total)
+
+    def mark_started(self) -> None:
+        self.playback_started = time.monotonic()
+        self.paused_at = None
+        self.paused_total = 0.0
+
+    def mark_paused(self) -> None:
+        if self.paused_at is None:
+            self.paused_at = time.monotonic()
+
+    def mark_resumed(self) -> None:
+        if self.paused_at is not None:
+            self.paused_total += time.monotonic() - self.paused_at
+            self.paused_at = None
+
+    # -- attached views -----------------------------------------------------
+
+    async def retire_controls(self) -> None:
+        """Grey out the buttons under the previous Now Playing message."""
+        view, self.controls = self.controls, None
+        if view is None:
+            return
+        try:
+            await view.retire()
+        except Exception:
+            log.debug("could not retire controls for guild %s", self.guild_id,
+                      exc_info=True)
 
     # -- idle disconnect ----------------------------------------------------
 
@@ -130,7 +183,10 @@ class GuildState:
         self.suppress_advance = False
         self.starting = False
         self.playback_started = 0.0
+        self.paused_at = None
+        self.paused_total = 0.0
         self.retried_url = None
+        self.controls = None
 
 
 class MusicState:

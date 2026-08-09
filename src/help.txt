@@ -9,6 +9,14 @@ All commands work two ways: type **`?command`** in any text channel, or use the 
 Add as many links as you like, before or during playback. They line up in a **queue** and play in order.
 Run **`?help`** at any time to see this list again.
 
+**Buttons**
+Every **Now playing** message comes with buttons, so the things you do most need no typing at all.
+- **⏸ Pause** — pauses, and turns into **▶ Resume**. The message updates in place.
+- **⏭ Skip** — jumps to the next song.
+- **📜 Queue** — opens the queue where only you can see it, with **◀ ▶** to page through and **🔄** to re-check it.
+You have to be in the voice channel to use them — they change what everyone hears.
+Buttons go grey when the song ends or after about 15 minutes. The commands always work.
+
 **Voice channel**
 - **`?join`** ***<voice channel>*** — Brings the bot into a voice channel. Use **`/join`** and pick from the list; **`?join`** needs the channel's ID, which is harder to find.
 - **`?leave`** — The bot disconnects but remembers the queue. Run **`?join`** again to carry on where you left off.
@@ -21,11 +29,14 @@ Run **`?help`** at any time to see this list again.
 - **`?skip`** — Jumps to the next song in the queue.
 - **`?skipto`** ***<number>*** — Jumps straight to a song further down the queue. Run **`?queue`** first to see the numbers.
   `?skipto 5`
+- **`?nowplaying`** — Shows what's playing, how far in it is, and what's next. The **Now playing** message tells you when the song ends and keeps that time up to date on its own; run this when you want the progress bar as well.
 
 **Queue**
 The queue is the list of songs waiting to play, in order. Everyone in the server shares the same one.
-- **`?queue`** — Shows the first 10 songs. The song playing right now is marked *(Playing)*.
-- **`?queueto`** ***<page>*** — Shows a later page of the queue, 10 songs per page.
+- **`?queue`** — Shows the queue. The song playing right now is marked **▶**.
+  - **◀ ▶** — page through, 10 songs per page. The number between them is the page you're on.
+  - **🔄** — re-reads the queue where you are. The list keeps changing as songs finish and people add more, so what you opened a minute ago may be out of date. On a queue that fits one page, this is the only button that does anything.
+- **`?queueto`** ***<page>*** — Opens the queue straight at a later page, 10 songs per page.
   `?queueto 3`
 - **`?clear`** — Empties the queue. The song playing right now is not interrupted.
 
