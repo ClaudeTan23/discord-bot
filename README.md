@@ -230,14 +230,19 @@ src/
   help.txt                  text shown by ?help
   music_player/
     config.py               constants, tunables, ffmpeg discovery
+    logs.py                 dated log files, context, redaction
     state.py                Track, GuildState, MusicState
     ytdl.py                 YouTube metadata + stream resolution
     ui.py                   embed builders, formatting, typing indicator
+    controls.py             buttons under Now Playing and the queue
     player.py               Player cog: queue and playback commands
     join_channel.py         JoinChannel cog
     leave_channel.py        LeaveChannel cog
 tests/
-  test_music_player.py      96 unit tests
+  test_music_player.py      264 unit tests
+logs/                       written at runtime, gitignored
+  2026/08/09/bot.log        everything, that day
+  2026/08/09/errors.log     warnings and errors only
 ```
 
 ### State
@@ -312,8 +317,9 @@ autocomplete response after 3 seconds, so `ytdl.py`:
 python -m unittest discover -s tests -v
 ```
 
-96 tests covering URL normalisation, duration formatting, queue pagination, state
-transitions, autocomplete gating, caching and request coalescing, and the concurrency
+264 tests covering URL normalisation, duration formatting, queue pagination, state
+transitions, autocomplete gating, caching and request coalescing, embed rendering,
+button permissions and paging, log rotation and redaction, and the concurrency
 safeguards above. They use test doubles and need no Discord token.
 
 The suite does **not** cover live voice playback — that requires a real Discord
@@ -323,7 +329,45 @@ connection and should be smoke-tested manually.
 
 ## Troubleshooting
 
-**`?add` says "Invalid link or unavailable video/playlist"**
+### Start with the logs
+
+Everything is written to a folder per day, so "what happened last night" is one
+folder away:
+
+```
+logs/2026/08/09/bot.log        everything
+logs/2026/08/09/errors.log     warnings and errors only
+```
+
+Check `errors.log` first — if it is empty, nothing broke. Every line carries the
+guild, user and command it came from, so you can follow one person's session
+through a busy log:
+
+```
+2026-08-09 21:04:11 INFO  music_bot  [guild=Cool Server user=tan cmd=play] run play (guild=849... channel=#music via=slash)
+2026-08-09 21:04:12 INFO  music_player.player  [guild=Cool Server user=tan cmd=play] using ffmpeg at ...
+2026-08-09 21:04:12 INFO  music_bot  [guild=Cool Server user=tan cmd=play] done in 812ms
+```
+
+A `run` line with no matching `done` is a command that hung — that pairing is
+the fastest way to find one.
+
+For a stubborn problem, turn up the detail in `.env` and reproduce it:
+
+```
+LOG_LEVEL = DEBUG
+```
+
+DEBUG adds the queue-supersede and cache decisions, which explain most "why did
+it skip that song" reports.
+
+The bot token and signed stream URLs are redacted before anything is written, so
+a log file is safe to attach to a bug report. Day folders older than
+`LOG_RETENTION_DAYS` (default 14) are deleted at startup.
+
+### Common problems
+
+**`?add` says "I couldn't read that link"**
 Usually an out-of-date yt-dlp; YouTube changes frequently. Update it:
 
 ```bash

@@ -7,12 +7,21 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import sys
+import tempfile
 import time
 import unittest
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
+
+# Importing app configures logging for real, and config reads LOG_DIR at import
+# time - so this has to be set before any music_player import below. Without it
+# the suite writes into the project's own logs/ tree.
+os.environ.setdefault(
+    "LOG_DIR", tempfile.mkdtemp(prefix="music-player-test-logs-")
+)
 
 # Several tests deliberately trigger failure paths; keep their logging out of
 # the test output.
@@ -1766,7 +1775,21 @@ class TestTitleClipping(unittest.TestCase):
     def test_long_titles_get_an_ellipsis(self):
         clipped = ui.clip("x" * 200, 20)
         self.assertTrue(clipped.endswith("…"))
-        self.assertLessEqual(len(clipped), 21)
+
+    def test_the_result_never_exceeds_the_limit(self):
+        """The ellipsis counts. Discord rejects a 257-character embed title."""
+        for limit in (5, 20, 45, 100, 256):
+            self.assertLessEqual(len(ui.clip("x" * 900, limit)), limit, limit)
+            self.assertLessEqual(len(ui.clip("[" * 900, limit)), limit, limit)
+
+    def test_pathological_input_still_fits_discords_embed_limits(self):
+        track = Track(WATCH, "T" * 900, 200, 1, "u")
+        embed = ui.added(track, 5, 3, playlist_title="P" * 900, total_seconds=100)
+        self.assertLessEqual(len(embed.title), 256)
+        self.assertLess(len(embed.description), 4096)
+
+        queue = ui.queue_page([track] * 10, 1, status=ui.PLAYING_MARKER)
+        self.assertLess(len(queue.description), 4096)
 
     def test_a_cut_inside_brackets_backs_out_of_them(self):
         """"Take On Me [Remas…" would break the [label](url) it sits inside."""
@@ -2471,6 +2494,346 @@ class TestSharedActions(unittest.IsolatedAsyncioTestCase):
         state.voice.playing = False
         state.voice.paused = True
         self.assertEqual(Player.status_marker(state), ui.PAUSED_MARKER)
+
+
+class _LogTestCase(unittest.TestCase):
+    """Base for log tests: a scratch tree and a calendar we control."""
+
+    def setUp(self):
+        import tempfile
+        from music_player import logs
+
+        self.logs = logs
+        self._tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self._tmp.name) / "logs"
+        self.addCleanup(self._tmp.cleanup)
+
+    def at(self, y, m, d):
+        """Pretend today is this date, for the duration of the block."""
+        import datetime as real_dt
+        return patch.object(self.logs, "_today", lambda: real_dt.date(y, m, d))
+
+    def read(self, y, m, d, stem="bot"):
+        path = self.root / f"{y:04d}" / f"{m:02d}" / f"{d:02d}" / f"{stem}.log"
+        return path.read_text(encoding="utf-8") if path.exists() else ""
+
+
+class TestDatedFolderHandler(_LogTestCase):
+    def _record(self, message="hello"):
+        return logging.LogRecord(
+            "test", logging.INFO, __file__, 1, message, None, None
+        )
+
+    def test_writes_into_a_year_month_day_folder(self):
+        with self.at(2026, 8, 9):
+            handler = self.logs.DatedFolderHandler(self.root, "bot")
+            handler.emit(self._record("first line"))
+            handler.close()
+        self.assertIn("first line", self.read(2026, 8, 9))
+
+    def test_midnight_moves_to_the_next_days_folder(self):
+        """The failure a long-running bot actually hits."""
+        with self.at(2026, 8, 9):
+            handler = self.logs.DatedFolderHandler(self.root, "bot")
+            handler.emit(self._record("tuesday"))
+        with self.at(2026, 8, 10):
+            handler.emit(self._record("wednesday"))
+            handler.close()
+
+        self.assertIn("tuesday", self.read(2026, 8, 9))
+        self.assertNotIn("wednesday", self.read(2026, 8, 9))
+        self.assertIn("wednesday", self.read(2026, 8, 10))
+
+    def test_a_new_month_and_year_nest_correctly(self):
+        with self.at(2026, 12, 31):
+            handler = self.logs.DatedFolderHandler(self.root, "bot")
+            handler.emit(self._record("old year"))
+        with self.at(2027, 1, 1):
+            handler.emit(self._record("new year"))
+            handler.close()
+        self.assertIn("new year", self.read(2027, 1, 1))
+
+    def test_a_huge_day_continues_in_a_numbered_part(self):
+        """One runaway error loop must not become one unopenable file."""
+        with self.at(2026, 8, 9):
+            handler = self.logs.DatedFolderHandler(self.root, "bot", max_bytes=200)
+            for i in range(40):
+                handler.emit(self._record(f"line {i} " + "x" * 40))
+            handler.close()
+
+        day = self.root / "2026" / "08" / "09"
+        parts = sorted(p.name for p in day.glob("bot*.log"))
+        self.assertIn("bot.log", parts)
+        self.assertIn("bot.2.log", parts)
+
+    def test_parts_reset_when_the_day_turns_over(self):
+        with self.at(2026, 8, 9):
+            handler = self.logs.DatedFolderHandler(self.root, "bot", max_bytes=120)
+            for i in range(20):
+                handler.emit(self._record("x" * 40))
+        with self.at(2026, 8, 10):
+            handler.emit(self._record("fresh day"))
+            handler.close()
+        # The new day starts at bot.log, not wherever the old one left off.
+        self.assertIn("fresh day", self.read(2026, 8, 10))
+
+    def test_a_title_the_console_cannot_encode_is_still_written(self):
+        """The bug that made this module necessary."""
+        with self.at(2026, 8, 9):
+            handler = self.logs.DatedFolderHandler(self.root, "bot")
+            handler.emit(self._record("スパークル [original ver.] 🎵"))
+            handler.close()
+        self.assertIn("スパークル", self.read(2026, 8, 9))
+
+
+class TestLogRetention(_LogTestCase):
+    def _make_day(self, y, m, d):
+        folder = self.root / f"{y:04d}" / f"{m:02d}" / f"{d:02d}"
+        folder.mkdir(parents=True, exist_ok=True)
+        (folder / "bot.log").write_text("x", encoding="utf-8")
+        return folder
+
+    def test_old_days_are_removed_and_recent_ones_kept(self):
+        old = self._make_day(2026, 7, 1)
+        recent = self._make_day(2026, 8, 8)
+
+        with self.at(2026, 8, 9):
+            removed = self.logs.prune(self.root, keep_days=14)
+
+        self.assertEqual(removed, 1)
+        self.assertFalse(old.exists())
+        self.assertTrue(recent.exists())
+
+    def test_empty_year_and_month_shells_are_tidied_away(self):
+        self._make_day(2026, 7, 1)
+        with self.at(2026, 8, 9):
+            self.logs.prune(self.root, keep_days=14)
+        self.assertFalse((self.root / "2026" / "07").exists())
+
+    def test_zero_keeps_everything(self):
+        old = self._make_day(2020, 1, 1)
+        with self.at(2026, 8, 9):
+            self.assertEqual(self.logs.prune(self.root, keep_days=0), 0)
+        self.assertTrue(old.exists())
+
+    def test_unrelated_folders_are_left_alone(self):
+        stray = self.root / "notes" / "for" / "later"
+        stray.mkdir(parents=True)
+        (stray / "keep.txt").write_text("mine", encoding="utf-8")
+        with self.at(2026, 8, 9):
+            self.logs.prune(self.root, keep_days=1)
+        self.assertTrue((stray / "keep.txt").exists())
+
+    def test_a_missing_root_is_not_an_error(self):
+        self.assertEqual(self.logs.prune(self.root / "nope", keep_days=7), 0)
+
+
+class TestTracingCannotBreakTheCommand(unittest.IsolatedAsyncioTestCase):
+    """Observability must never take down the thing it observes."""
+
+    async def test_a_hostile_argument_does_not_stop_the_command(self):
+        """str() on a command argument raising must cost a log line, not the run."""
+        import app
+
+        class Exploding:
+            def __str__(self):
+                raise RuntimeError("nope")
+            __repr__ = __str__
+
+        ctx = MagicMock()
+        ctx.command.qualified_name = "add"
+        ctx.kwargs = {"url": Exploding()}
+
+        described = app._describe(ctx)          # must not raise
+        self.assertIn("add", described)
+
+    async def test_the_traced_block_still_runs_when_binding_fails(self):
+        from music_player import logs
+
+        ran = []
+        with patch.object(logs, "bind", side_effect=RuntimeError("boom")):
+            with logs.traced("thing"):
+                ran.append(True)
+        self.assertEqual(ran, [True])
+
+    async def test_the_traced_block_still_runs_when_logging_is_broken(self):
+        from music_player import logs
+
+        ran = []
+        with patch.object(logs.log, "info", side_effect=RuntimeError("disk full")):
+            with logs.traced("thing"):
+                ran.append(True)
+        self.assertEqual(ran, [True])
+
+    async def test_the_callers_own_exception_still_propagates(self):
+        """Guarding the trace must not swallow real failures."""
+        from music_player import logs
+
+        with self.assertRaises(ValueError):
+            with logs.traced("thing"):
+                raise ValueError("the actual bug")
+
+    async def test_context_is_released_even_when_the_body_raises(self):
+        from music_player import logs
+
+        record = logging.LogRecord("t", logging.INFO, __file__, 1, "m", None, None)
+        try:
+            with logs.traced("thing", guild="Cool Server"):
+                raise ValueError
+        except ValueError:
+            pass
+        logs._ContextFilter().filter(record)
+        self.assertEqual(record.ctx, "")
+
+
+class TestFfmpegIsLogged(unittest.TestCase):
+    """ffmpeg is where playback actually fails, so none of it may be muted."""
+
+    def setUp(self):
+        # The suite silences logging globally; these tests are about whether a
+        # record is emitted at all, so they need it back for their duration.
+        logging.disable(logging.NOTSET)
+        self.addCleanup(logging.disable, logging.CRITICAL)
+
+    def test_ffmpeg_stderr_is_routed_into_logging(self):
+        from music_player.player import _FFmpegLog
+
+        sink = _FFmpegLog("https://youtube.com/watch?v=x")
+        with self.assertLogs("music_player.player", level="WARNING") as caught:
+            sink.write(b"[tcp @ 0x1] Failed to resolve hostname rr3---sn-x\n")
+        self.assertIn("Failed to resolve hostname", caught.output[0])
+
+    def test_the_sink_has_no_fileno(self):
+        """That absence is how discord.py decides to pipe stderr to us at all."""
+        from music_player.player import _FFmpegLog
+
+        self.assertFalse(hasattr(_FFmpegLog("u"), "fileno"))
+
+    def test_blank_ffmpeg_output_is_not_logged(self):
+        from music_player.player import _FFmpegLog
+
+        logger = logging.getLogger("music_player.player")
+        with patch.object(logger, "warning") as warned:
+            _FFmpegLog("u").write(b"   \n")
+        warned.assert_not_called()
+
+    def test_discord_player_is_exempt_from_the_gateway_muting(self):
+        """It carries the ffmpeg command line and, crucially, the exit code.
+
+        _ended_early exists because ffmpeg returns 0 after a 403; this logger
+        is the only place the real return code shows up.
+        """
+        from music_player import logs
+
+        # configure() has already run for the suite, so assert the outcome.
+        logs.configure()
+        self.assertLessEqual(
+            logging.getLogger("discord.player").level, logging.INFO
+        )
+        self.assertLessEqual(
+            logging.getLogger("discord.voice_client").level, logging.INFO
+        )
+
+
+class TestLogRedaction(unittest.TestCase):
+    """A log file must always be safe to paste into a bug report."""
+
+    def _render(self, message, *, secrets=()):
+        from music_player import logs
+
+        formatter = logs._SafeFormatter("%(message)s", secrets=secrets)
+        record = logging.LogRecord("t", logging.INFO, __file__, 1, message, None, None)
+        record.ctx = ""
+        return formatter.format(record)
+
+    def test_the_bot_token_never_reaches_the_output(self):
+        token = "MTIzNDU2Nzg5.SUPERSECRET.abcdefg"
+        out = self._render(f"login with {token}", secrets=(token,))
+        self.assertNotIn(token, out)
+        self.assertIn("***redacted***", out)
+
+    def test_signed_stream_parameters_are_scrubbed(self):
+        out = self._render(
+            "https://x.googlevideo.com/vp?expire=1&signature=DEADBEEF&pot=SECRET"
+        )
+        self.assertNotIn("DEADBEEF", out)
+        self.assertNotIn("SECRET", out)
+        # The rest of the URL survives - it is what makes the log useful.
+        self.assertIn("googlevideo.com", out)
+        self.assertIn("expire=1", out)
+
+    def test_cookie_headers_are_scrubbed(self):
+        out = self._render("-headers Cookie: SID=abc123; HSID=xyz")
+        self.assertNotIn("abc123", out)
+
+    def test_an_empty_secret_does_not_redact_everything(self):
+        out = self._render("perfectly ordinary line", secrets=("",))
+        self.assertEqual(out, "perfectly ordinary line")
+
+
+class TestLogContext(unittest.TestCase):
+    def _render(self):
+        from music_player import logs
+
+        record = logging.LogRecord("t", logging.INFO, __file__, 1, "msg", None, None)
+        logs._ContextFilter().filter(record)
+        return record.ctx
+
+    def test_no_context_renders_nothing(self):
+        """Background tasks shouldn't each pay for a row of empty fields."""
+        self.assertEqual(self._render(), "")
+
+    def test_bound_fields_appear(self):
+        from music_player import logs
+
+        with logs.context(guild="Cool Server", user="tan"):
+            rendered = self._render()
+        self.assertIn("guild=Cool Server", rendered)
+        self.assertIn("user=tan", rendered)
+
+    def test_context_is_released_afterwards(self):
+        from music_player import logs
+
+        with logs.context(guild="Cool Server"):
+            pass
+        self.assertEqual(self._render(), "")
+
+    def test_nested_binds_merge(self):
+        from music_player import logs
+
+        with logs.context(guild="Cool Server"):
+            with logs.context(cmd="play"):
+                rendered = self._render()
+        self.assertIn("guild=Cool Server", rendered)
+        self.assertIn("cmd=play", rendered)
+
+    def test_none_values_are_dropped(self):
+        from music_player import logs
+
+        with logs.context(guild="Cool Server", user=None):
+            self.assertNotIn("user=", self._render())
+
+    async def _tagged(self, name, seen):
+        from music_player import logs
+
+        with logs.context(cmd=name):
+            await asyncio.sleep(0)
+            seen[name] = self._render()
+
+    def test_concurrent_commands_do_not_leak_into_each_other(self):
+        """Each invocation is its own task, so contexts must stay separate."""
+        seen = {}
+
+        async def run():
+            await asyncio.gather(
+                self._tagged("play", seen), self._tagged("skip", seen)
+            )
+
+        asyncio.run(run())
+        self.assertIn("cmd=play", seen["play"])
+        self.assertNotIn("skip", seen["play"])
+        self.assertIn("cmd=skip", seen["skip"])
+        self.assertNotIn("play", seen["skip"])
 
 
 if __name__ == "__main__":
