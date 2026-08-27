@@ -12,9 +12,10 @@ import discord
 from discord import Embed, Interaction, app_commands
 from discord.ext import commands
 
-from music_player import ui
+from music_player.ui import embeds as ui
 from music_player.audio import BufferedAudioSource
-from music_player.controls import PlayerControls, QueuePages
+from music_player.ui.views import PlayerControls, QueuePages
+from music_player.errors import DELIVERY_FAILED
 from music_player.config import (
     ADD_PER,
     ADD_RATE,
@@ -28,7 +29,7 @@ from music_player.config import (
     resolve_ffmpeg,
 )
 from music_player.state import GuildState, MusicState, Track
-from music_player.ytdl import (
+from music_player.services.youtube import (
     ExtractionError,
     StreamInfo,
     YouTubeService,
@@ -265,7 +266,7 @@ class Player(commands.Cog):
                 embed=ui.now_playing(snapshot), view=view
             )
             state.controls = view
-        except discord.HTTPException:
+        except DELIVERY_FAILED:
             # The song is playing either way - a missing announcement must not
             # take the audio down with it.
             log.warning("could not post the now playing message", exc_info=True)
@@ -291,6 +292,7 @@ class Player(commands.Cog):
             total=len(state.queue),
             up_next=state.queue[1] if len(state.queue) > 1 else None,
             remaining=ui.total_duration(state.queue),
+            source=track.source,
         )
 
     async def _fetch_requester(
@@ -304,7 +306,7 @@ class Player(commands.Cog):
                 return member
             try:
                 return await guild.fetch_member(track.requester_id)
-            except discord.HTTPException:
+            except DELIVERY_FAILED:
                 log.debug("could not fetch member %s", track.requester_id)
         return self.bot.user
 
@@ -474,7 +476,7 @@ class Player(commands.Cog):
         # Reply through ctx, not ctx.channel: for a slash command this defers
         # the interaction, and only ctx.send resolves it.
         async with ui.thinking(ctx):
-            responded = await self._play_current(ctx, state, forced=False)
+            responded = await self.start_queue(ctx, state)
 
         if not responded:
             # A deferred interaction must never be left unanswered.
@@ -506,6 +508,9 @@ class Player(commands.Cog):
                 await ctx.send(embed=ui.generic_error())
                 return
 
+            # A playlist link puts its own name on every song it brings, so
+            # Now Playing can say where the track came from.
+            source = result.playlist_title if result.is_playlist else None
             tracks = [
                 Track(
                     url=entry.url,
@@ -513,6 +518,7 @@ class Player(commands.Cog):
                     duration=entry.duration,
                     requester_id=ctx.author.id,
                     requester_name=ctx.author.name,
+                    source=source,
                 )
                 for entry in result.entries
             ]
@@ -625,7 +631,7 @@ class Player(commands.Cog):
             await ctx.send(embed=ui.not_in_voice())
             return
 
-        await ctx.send(embed=ui.skipped(state.current))
+        await ctx.send(embed=ui.skipped(state.current, by=ctx.author))
         await self.perform_skip(ctx.channel, state)
 
     @commands.hybrid_command(name="skipto", description="Jump to a song further down")
@@ -645,7 +651,7 @@ class Player(commands.Cog):
         target = state.queue[number - 1]
         # Drop everything before the target; _advance pops the final one.
         del state.queue[: max(0, number - 2)]
-        await ctx.send(embed=ui.jumping_to(target))
+        await ctx.send(embed=ui.jumping_to(target, by=ctx.author))
         await self.perform_skip(ctx.channel, state)
 
     @commands.hybrid_command(name="pause", description="Pause the current song")
@@ -656,7 +662,11 @@ class Player(commands.Cog):
             return
 
         if self.apply_pause(state):
-            await ctx.send(embed=ui.paused())
+            # Read after the pause: mark_paused freezes `elapsed`, so this is
+            # the spot the track will pick up from rather than a moving one.
+            await ctx.send(
+                embed=ui.paused(state.current, state.elapsed, by=ctx.author)
+            )
             await self._repaint(state)
         elif state.paused:
             await ctx.send(embed=ui.notice("⏸  **Already paused.**"))
@@ -671,7 +681,9 @@ class Player(commands.Cog):
             return
 
         if self.apply_resume(state):
-            await ctx.send(embed=ui.resumed())
+            await ctx.send(
+                embed=ui.resumed(state.current, state.elapsed, by=ctx.author)
+            )
             await self._repaint(state)
         elif state.playing:
             await ctx.send(embed=ui.notice("▶  **Already playing.**"))
@@ -728,6 +740,20 @@ class Player(commands.Cog):
     # shared actions - the commands above and the buttons in ``controls``
     # both route through these, so a press and a command cannot drift apart
     # ------------------------------------------------------------------
+
+    async def start_queue(
+        self, destination: discord.abc.Messageable, state: GuildState
+    ) -> bool:
+        """Start playing at the head of the queue.
+
+        The public way in. ``?play`` and the playlist loader both come through
+        here so that "start the audio" stays one implementation rather than
+        two that drift apart.
+
+        Returns:
+            ``False`` only when nothing was sent because audio already plays.
+        """
+        return await self._play_current(destination, state, forced=False)
 
     def apply_pause(self, state: GuildState) -> bool:
         """Pause playback. Returns False when there was nothing to pause."""
@@ -817,6 +843,7 @@ class Player(commands.Cog):
                 remaining=ui.total_duration(state.queue),
                 elapsed=state.elapsed,
                 paused=state.paused,
+                source=track.source,
             )
         )
 

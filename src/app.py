@@ -13,14 +13,23 @@ from discord import Game, Status
 from discord.ext import commands
 from dotenv import load_dotenv
 
-from music_player import logs, ui
-from music_player.config import COMMAND_PREFIX, ENV_FILE, HELP_FILE
-from music_player.help import HelpManual, send_manual
-from music_player.join_channel import JoinChannel
-from music_player.leave_channel import LeaveChannel
-from music_player.player import Player
+from music_player.errors import DELIVERY_FAILED
+from music_player import logs
+from music_player.cogs.player import Player
+from music_player.cogs.playlists import Playlists
+from music_player.cogs.voice import JoinChannel, LeaveChannel
+from music_player.config import (
+    COMMAND_PREFIX,
+    ENV_FILE,
+    HELP_FILE,
+    PLAYLIST_DB,
+    SYNC_GUILD_ID,
+)
+from music_player.services.library import PlaylistLibrary
+from music_player.services.youtube import YouTubeService
 from music_player.state import MusicState
-from music_player.ytdl import YouTubeService
+from music_player.ui import embeds as ui
+from music_player.ui.manual import HelpManual, send_manual
 
 # Before anything is constructed: MusicBot() reads the help file and logs about
 # it, and those records are worth keeping too.
@@ -46,6 +55,10 @@ class MusicBot(commands.Bot):
         self.music_state = MusicState()
         self.youtube = YouTubeService()
         self.help_manual = HelpManual(HELP_FILE)
+        # Opens the database, creates the tables and imports any legacy JSON
+        # store - all before the loop starts. Every query after this is a
+        # coroutine that runs its SQL on a worker thread.
+        self.playlists = PlaylistLibrary(PLAYLIST_DB)
 
     async def setup_hook(self) -> None:
         """Register cogs exactly once.
@@ -58,16 +71,51 @@ class MusicBot(commands.Bot):
 
         await self.add_cog(JoinChannel(self, self.music_state))
         await self.add_cog(LeaveChannel(self, self.music_state))
-        await self.add_cog(Player(self, self.music_state, self.youtube))
-        await self.tree.sync()
+        # Playlists drives playback through the Player cog rather than its own
+        # copy of the pipeline, so it is handed the instance directly.
+        player = Player(self, self.music_state, self.youtube)
+        await self.add_cog(player)
+        await self.add_cog(
+            Playlists(self, self.music_state, self.youtube, self.playlists, player)
+        )
+        await self._sync_commands()
         log.info("cogs registered and command tree synced")
+
+    async def _sync_commands(self) -> None:
+        """Publish the slash commands.
+
+        The global sync is the one that matters - it reaches every server the
+        bot is in - but Discord can take up to an hour to roll it out, during
+        which a newly added command simply is not there. A guild sync lands
+        immediately, so SYNC_GUILD_ID publishes to one server up front while
+        the global sync catches up for everyone else.
+        """
+        if SYNC_GUILD_ID:
+            guild = discord.Object(id=SYNC_GUILD_ID)
+            self.tree.copy_global_to(guild=guild)
+            try:
+                synced = await self.tree.sync(guild=guild)
+                log.info(
+                    "published %d commands to guild %s immediately",
+                    len(synced),
+                    SYNC_GUILD_ID,
+                )
+            except discord.HTTPException:
+                # Wrong id, or the bot is not in that server. The global sync
+                # below still has to happen either way.
+                log.warning(
+                    "could not sync to guild %s - check SYNC_GUILD_ID",
+                    SYNC_GUILD_ID,
+                    exc_info=True,
+                )
+        await self.tree.sync()
 
     async def invoke(self, ctx: commands.Context) -> None:
         """Trace every command, and tag everything it logs along the way.
 
         Overriding ``invoke`` rather than listening to ``on_command`` puts this
         in the *same task* as the command body - which is what lets the bound
-        context reach records logged deep inside ``ytdl`` or ``player``. Hybrid
+        context reach records logged deep inside ``youtube`` or ``player``. Hybrid
         commands route their slash invocations through here as well, so prefix
         and slash are both covered by the one hook.
         """
@@ -91,14 +139,18 @@ class MusicBot(commands.Bot):
         """Tear down worker threads before the loop stops."""
         log.info("shutting down")
         self.youtube.close()
+        self.playlists.close()
         await super().close()
         logging.shutdown()  # flush the day's file before the process goes
 
     async def on_command_error(
         self, ctx: commands.Context, error: commands.CommandError
     ) -> None:
-        # Commands with their own @cmd.error handler are already covered.
+        # Commands with their own @cmd.error handler are already covered, as
+        # is a cog that answers for its whole group in cog_command_error.
         if getattr(ctx.command, "has_error_handler", lambda: False)():
+            return
+        if ctx.cog is not None and ctx.cog.has_error_handler():
             return
         if isinstance(error, commands.CommandNotFound):
             # Logged, not silent: a burst of these is usually someone using a
@@ -106,9 +158,35 @@ class MusicBot(commands.Bot):
             log.debug("unknown command: %r", getattr(ctx.message, "content", "")[:80])
             return
         log.exception("unhandled command error in %s", ctx.command, exc_info=error)
+        await self._report_failure(ctx)
+
+    @staticmethod
+    async def _report_failure(ctx: commands.Context) -> None:
+        """Tell the user something went wrong, by whatever route still works.
+
+        A slash command is answered through its interaction, and that token
+        dies: Discord expects acknowledgement within three seconds and returns
+        ``10062 Unknown interaction`` afterwards. A gateway outage is exactly
+        when that happens - events arrive late, the token is already stale, and
+        the reply 404s.
+
+        Falling back to the channel is what turns "the bot ignored me" into a
+        visible failure. Only worth trying for an interaction: a prefix command
+        was already sending to the channel, so a second attempt fails the same
+        way.
+        """
         try:
             await ctx.send(embed=ui.generic_error())
-        except discord.HTTPException:
+            return
+        except DELIVERY_FAILED:
+            if ctx.interaction is None:
+                log.warning("could not deliver the error message", exc_info=True)
+                return
+            log.info("interaction is gone; replying in the channel instead")
+
+        try:
+            await ctx.channel.send(embed=ui.generic_error())
+        except (*DELIVERY_FAILED, AttributeError):
             log.warning("could not deliver the error message", exc_info=True)
 
     async def on_error(self, event: str, *args: object, **kwargs: object) -> None:

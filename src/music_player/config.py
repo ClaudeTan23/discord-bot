@@ -21,6 +21,42 @@ load_dotenv(ENV_FILE)
 COMMAND_PREFIX = "?"
 HELP_FILE = PROJECT_ROOT / "src" / "help.txt"
 
+#: One server to publish slash commands to immediately, on top of the global
+#: sync. Discord can take up to an hour to roll a *global* command out to
+#: everyone, which makes a newly added command look broken; a guild sync is
+#: instant. Set SYNC_GUILD_ID to your own server's id while developing. 0 (the
+#: default) does the global sync alone.
+SYNC_GUILD_ID = int(os.environ.get("SYNC_GUILD_ID", "").strip() or 0)
+
+# -- saved playlists --------------------------------------------------------
+#: Where every server's saved playlists live: a SQLite file. Adding one song
+#: writes one row, whatever else is stored - which is what the JSON store this
+#: replaced could not do, since it rewrote the whole document every time.
+#:
+#: A ``playlists.json`` sitting beside this path is imported once on startup
+#: and then renamed out of the way. Override with PLAYLIST_DB.
+PLAYLIST_DB = Path(
+    os.environ.get("PLAYLIST_DB", "").strip()
+    or (PROJECT_ROOT / "data" / "playlists.db")
+)
+#: Playlists one server may hold, shared by everyone in it. Also Discord's
+#: ceiling on the options in a single dropdown, which is what the picker under
+#: ``?playlist`` is - more than this could not be shown there anyway.
+MAX_PLAYLISTS_PER_GUILD = 25
+#: Songs one playlist may hold. Adding a longer YouTube playlist than this
+#: fills the remaining room and says how many did not fit.
+#:
+#: Large enough to swallow two full YouTube playlists, which cap at 5,000
+#: videos each. Note that the whole library is rewritten on every change, so
+#: this multiplied by MAX_PLAYLISTS_PER_GUILD is what sets the worst-case save
+#: cost - see the storage notes in the README before raising it further.
+MAX_PLAYLIST_TRACKS = 10_000
+#: Longest playlist name. Well inside Discord's 100-character limit on a
+#: dropdown label, so a name is never shown clipped in the picker.
+PLAYLIST_NAME_LIMIT = 60
+#: Songs listed per page when browsing a saved playlist.
+PLAYLIST_PAGE_SIZE = 10
+
 # -- logging ----------------------------------------------------------------
 #: Root of the log tree. Each day gets its own folder underneath, so finding
 #: "what happened on the 3rd" is opening a folder rather than reading filename
@@ -161,6 +197,9 @@ CONTROLS_TIMEOUT = 900.0
 #: Queue pagination is browsed in one sitting; a short timeout keeps the bot
 #: from holding thousands of views for messages nobody is reading.
 QUEUE_VIEW_TIMEOUT = 180.0
+#: The playlist browser is read-and-pick, so it lives about as long as a queue
+#: listing does.
+PLAYLIST_VIEW_TIMEOUT = 300.0
 
 
 _FFMPEG_NAMES = ("ffmpeg.exe", "ffmpeg")

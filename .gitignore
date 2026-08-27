@@ -12,3 +12,7 @@ __pycache__/
 # Runtime logs (logs/YYYY/MM/DD/). Credentials are redacted before they are
 # written, but there is still no reason to commit them.
 /logs
+
+# Saved playlists (data/playlists.json). Users' own content, and
+# rewritten on every change - not something to keep in git.
+/data
