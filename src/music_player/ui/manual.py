@@ -16,6 +16,9 @@ from typing import List, Optional, Tuple
 import discord
 from discord.ext import commands
 
+from music_player.errors import DELIVERY_FAILED
+from music_player.config import COLOUR_NEUTRAL
+
 log = logging.getLogger(__name__)
 
 #: A heading is a line that is *only* bold - ``**Playback**``. A line that
@@ -28,8 +31,30 @@ _LABEL_LIMIT = 100
 _OPTION_LIMIT = 25
 
 _DEFAULT_TITLE = "Commands"
-_FOOTER = "Use the menu below to browse the other categories."
 _EXPIRED = "This menu has expired"
+
+#: A heading may start with an emoji - ``**🚀 Getting started**``. It is lifted
+#: out into the dropdown option's own icon slot, where Discord renders it
+#: beside the label rather than inside it, and left in the embed title.
+_ICON = re.compile(r"^(\S{1,3})\s+(\S.*)$")
+
+
+def split_icon(name: str) -> Tuple[Optional[str], str]:
+    """``"🚀 Getting started"`` -> ``("🚀", "Getting started")``.
+
+    Only a short, wholly non-ASCII first token counts. Anything else is part
+    of the name: handing Discord a stray ``-`` as an emoji would have it
+    reject the whole message.
+    """
+    match = _ICON.match(name)
+    if match and all(not character.isascii() for character in match.group(1)):
+        return match.group(1), match.group(2)
+    return None, name
+
+
+def _footer(page: int, pages: int) -> str:
+    """Where you are, and that there is more."""
+    return f"Page {page} of {pages} · use the menu below to browse"
 
 
 @dataclass(frozen=True, slots=True)
@@ -77,7 +102,7 @@ def build_embed(section: Section, *, intro: str = "") -> discord.Embed:
     if len(body) > _DESCRIPTION_LIMIT:
         body = body[: _DESCRIPTION_LIMIT - 1] + "…"
     return discord.Embed(
-        colour=discord.Colour.dark_grey(),
+        colour=COLOUR_NEUTRAL,
         title=section.name,
         description=body,
     )
@@ -171,8 +196,12 @@ class HelpView(discord.ui.View):
         self._select: discord.ui.Select = discord.ui.Select(
             placeholder="Choose a category",
             options=[
-                discord.SelectOption(label=section.name[:_LABEL_LIMIT], value=str(index))
-                for index, section in enumerate(self._sections)
+                discord.SelectOption(
+                    emoji=icon, label=label[:_LABEL_LIMIT], value=str(index)
+                )
+                for index, (icon, label) in enumerate(
+                    split_icon(section.name) for section in self._sections
+                )
             ],
         )
         self._select.callback = self._choose
@@ -185,7 +214,7 @@ class HelpView(discord.ui.View):
         """The page shown before anything is picked."""
         embed = build_embed(self._sections[0], intro=self._intro)
         if len(self._sections) > 1:
-            embed.set_footer(text=_FOOTER)
+            embed.set_footer(text=_footer(1, len(self._sections)))
         return embed
 
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
@@ -205,7 +234,7 @@ class HelpView(discord.ui.View):
         for option in self._select.options:
             option.default = option.value == chosen
         embed = build_embed(self._sections[int(chosen)])
-        embed.set_footer(text=_FOOTER)
+        embed.set_footer(text=_footer(int(chosen) + 1, len(self._sections)))
         await interaction.response.edit_message(embed=embed, view=self)
 
     async def on_timeout(self) -> None:
@@ -216,7 +245,7 @@ class HelpView(discord.ui.View):
             return
         try:
             await self.message.edit(view=self)
-        except discord.HTTPException:
+        except DELIVERY_FAILED:
             log.debug("could not disable the expired help menu", exc_info=True)
 
 

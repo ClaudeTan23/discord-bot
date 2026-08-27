@@ -10,7 +10,7 @@ from discord import Interaction
 from discord import app_commands as appCommand
 from discord.ext import commands
 
-from music_player import ui
+from music_player.ui import embeds as ui
 from music_player.state import MusicState
 
 log = logging.getLogger(__name__)
@@ -111,3 +111,24 @@ class JoinChannel(commands.Cog):
             )
         else:
             log.error("join command error: %s", error)
+
+
+class LeaveChannel(commands.Cog):
+    """Disconnects the bot from its current voice channel."""
+
+    def __init__(self, bot: commands.Bot, state: MusicState) -> None:
+        self.bot = bot
+        self.state = state
+
+    @commands.hybrid_command(name="leave", description="Leave current joined voice channel")
+    async def leave(self, ctx: commands.Context) -> None:
+        state = self.state.get(ctx.guild.id)
+
+        if not state.connected:
+            await ctx.send(embed=ui.notice("👍  **I'm not in a voice channel.**"))
+            return
+
+        state.suppress_advance = True
+        await state.retire_controls()
+        await state.disconnect()
+        await ctx.send(embed=ui.left())

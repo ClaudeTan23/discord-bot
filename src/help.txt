@@ -1,51 +1,85 @@
-All commands work two ways: type **`?command`** in any text channel, or use the slash command **`/command`**. Slash commands are easier — they show you the options as you type.
+**Music from YouTube, straight into your voice channel.** Three steps to start — the menu below has everything else.
 
-**Getting started**
-- **1.** Join a voice channel yourself, then run **`/join`** and pick that channel from the list.
-- **2.** Run **`?add`** with a YouTube link to put a song in the queue.
-  `?add https://www.youtube.com/watch?v=dQw4w9WgXcQ`
-- **3.** Run **`?play`**. The first song in the queue starts.
+**🚀 Getting started**
+### Play something now
+- **1.** Join a voice channel, then run **`/join`** and pick it from the list.
+- **2.** Run **`/add`** and paste a YouTube link.
+  `/add https://www.youtube.com/watch?v=dQw4w9WgXcQ`
+- **3.** Run **`/play`**.
 
-Add as many links as you like, before or during playback. They line up in a **queue** and play in order.
-Run **`?help`** at any time to see this list again.
+A **Now playing** message appears with **⏸ Pause** and **⏭ Skip** buttons on it. That's the whole thing.
 
-**Buttons**
-Every **Now playing** message comes with buttons, so the things you do most need no typing at all.
-- **⏸ Pause** — pauses, and turns into **▶ Resume**. The message updates in place.
-- **⏭ Skip** — jumps to the next song.
-- **📜 Queue** — opens the queue where only you can see it, with **◀ ▶** to page through and **🔄** to re-check it.
-You have to be in the voice channel to use them — they change what everyone hears.
-Buttons go grey when the song ends or after about 15 minutes. The commands always work.
+### `/play` and `?play` both work
+**`/play`** shows you the command and fills in the options as you type, so there is nothing to memorise. **`?play`** is the same command typed straight into chat, and it's quicker once you know the name. This manual writes **`?`** to keep things short.
 
-**Voice channel**
-- **`?join`** ***<voice channel>*** — Brings the bot into a voice channel. Use **`/join`** and pick from the list; **`?join`** needs the channel's ID, which is harder to find.
-- **`?leave`** — The bot disconnects but remembers the queue. Run **`?join`** again to carry on where you left off.
-- **`?stop`** — Stops the music, disconnects, and empties the queue.
+### Where to go next
+**Queue** — the songs lined up behind this one.
+**Playlists** — save songs once with **`?playlist`**, and start the lot with one command every time after.
 
-**Playback**
-- **`?add`** ***<YouTube link>*** — Adds a song to the end of the queue. Paste a **playlist** link and every song in it is added at once.
-- **`?play`** — Starts playing from the top of the queue.
-- **`?pause`** — Pauses the music. **`?resume`** continues from the exact same spot.
-- **`?skip`** — Jumps to the next song in the queue.
-- **`?skipto`** ***<number>*** — Jumps straight to a song further down the queue. Run **`?queue`** first to see the numbers.
-  `?skipto 5`
-- **`?nowplaying`** — Shows what's playing, how far in it is, and what's next. The **Now playing** message tells you when the song ends and keeps that time up to date on its own; run this when you want the progress bar as well.
+**🎵 Playing music**
+### Getting the bot in and out
+- **`?join`** ***<channel>*** — Use **`/join`** and pick from the list; the **`?`** form needs a channel ID, which is harder to find.
+- **`?leave`** — Disconnects, but remembers the queue.
+- **`?stop`** — Stops, empties the queue, and leaves.
 
-**Queue**
-The queue is the list of songs waiting to play, in order. Everyone in the server shares the same one.
-- **`?queue`** — Shows the queue. The song playing right now is marked **▶**.
-  - **◀ ▶** — page through, 10 songs per page. The number between them is the page you're on.
-  - **🔄** — re-reads the queue where you are. The list keeps changing as songs finish and people add more, so what you opened a minute ago may be out of date. On a queue that fits one page, this is the only button that does anything.
-- **`?queueto`** ***<page>*** — Opens the queue straight at a later page, 10 songs per page.
-  `?queueto 3`
-- **`?clear`** — Empties the queue. The song playing right now is not interrupted.
-
-**Volume**
-- **`?volume`** ***<0 to 100>*** — Sets how loud the bot plays for everyone. It starts at **10**, and the change is heard straight away — no need to restart the song.
+### While it's playing
+- **`?add`** ***<YouTube link>*** — Adds a song to the queue. A **playlist** link adds every song in it at once.
+- **`?play`** — Starts from the top of the queue.
+- **`?pause`** — Pauses, and shows exactly where it stopped. **`?resume`** picks up from that spot. Leave it paused for about a minute and the bot disconnects on its own.
+- **`?skip`** — Jumps to the next song, and says who did.
+- **`?nowplaying`** — What's playing, how far in it is, what's next, and which playlist it came from.
+- **`?volume`** ***<0 to 100>*** — Starts at **10**, and the change is heard straight away.
   `?volume 25`
 
-**Notes**
-- The bot leaves on its own after about a minute with nothing playing, so it does not sit in your channel all day.
-- Songs that are private, deleted, or blocked in your country are skipped automatically, and the bot tells you which ones.
-- If a song fails to load, it is tried once more on a fresh link before being skipped.
-- Adding many links quickly may get you a short "slow down" message. Nothing is lost — wait a few seconds and try again.
+**📜 Queue**
+The queue is the line of songs waiting to play. Everyone in the server shares it, and it empties when the bot stops.
+
+- **`?queue`** — Shows it. The song playing right now is marked **▶**.
+- **`?queueto`** ***<page>*** — Opens it at a later page, 10 songs each.
+  `?queueto 3`
+- **`?skipto`** ***<number>*** — Jumps straight to a song further down. Run **`?queue`** first to see the numbers.
+- **`?clear`** — Empties it. The song playing right now is not interrupted.
+
+-# **◀ ▶** page through · the **page number** between them jumps straight to any page · **🔄** re-reads where you are, since songs finish and people add more while you're looking.
+
+**💾 Playlists**
+A playlist is songs you save once and start again with one command. It belongs to **this server** — everyone here can add to it, play it, and it's still there after a restart.
+
+### Make one
+- **1.** **`?playlist create Late Night`**
+- **2.** **`?playlist add "Late Night" <YouTube link>`** — a whole YouTube playlist link works too.
+- **3.** **`?playlist play Late Night`**
+
+From then on, step 3 is the only one you need.
+
+### Or skip the typing
+Run **`?playlist`** on its own, pick one from the menu, and press **▶ Play** or **➕ Add to queue**. Long ones page with **◀ ▶**, or tap the page number to jump.
+
+### Every command
+- **`?playlist`** — All of them, with the picker. The one playing right now is marked **▶**.
+- **`?playlist create`** ***<name>*** — A new, empty one.
+- **`?playlist add`** ***<name> <link>*** — Adds a song, or a whole YouTube playlist.
+- **`?playlist show`** ***<name>*** — What's inside, 10 songs per page.
+- **`?playlist remove`** ***<name> <number>*** — Takes one song out, by the number **`?playlist show`** prints.
+- **`?playlist play`** ***<name>*** — **Replaces** the queue and starts it.
+- **`?playlist queue`** ***<name>*** — **Keeps** the queue and adds to the end. Tells you which song it opens with and how long until you hear it.
+- **`?playlist rename`** ***<old> <new>*** and **`?playlist delete`** ***<name>*** — Its creator, or **Manage Server**.
+
+### Good to know
+Anyone here can add and remove **songs**. Only whoever made a playlist, or a moderator, can rename or delete the **playlist itself**.
+Names with spaces need quotes on **`add`**, **`remove`** and **`rename`** — or use **`/playlist`**, which needs none and lists the names as you type.
+Playing one **copies** it into the queue, so **`?clear`** and **`?skip`** never change the playlist. Up to 25 per server, 10,000 songs each.
+
+**🎛️ Buttons**
+Every **Now playing** message comes with buttons, so the things you do most need no typing at all.
+- **⏸ Pause** — pauses, and turns into **▶ Resume**. The message updates in place and says who paused it.
+- **⏭ Skip** — jumps to the next song, and says who pressed it.
+- **📜 Queue** — opens the queue where only you can see it.
+
+You have to be in the voice channel to use them, because they change what everyone hears. They go grey when the song ends or after about 15 minutes. The message stops updating at the same time, so an old one shows where the song had got to rather than pretending to be live. The commands always work.
+
+**💡 Notes**
+- The bot leaves on its own after about a minute with nothing playing, so it doesn't sit in your channel all day.
+- Songs that are private, deleted, or blocked in your country are skipped automatically, and the bot says which ones.
+- If a song fails to load, it's tried once more on a fresh link before being skipped.
+- Adding lots of links quickly may get you a short "slow down" message. Nothing is lost — wait a few seconds.

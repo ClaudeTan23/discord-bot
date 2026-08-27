@@ -8,6 +8,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import re
 import sys
 import tempfile
 import time
@@ -30,13 +31,14 @@ logging.disable(logging.CRITICAL)
 import discord  # noqa: E402
 from unittest.mock import AsyncMock, MagicMock, patch  # noqa: E402
 
-from music_player import ui  # noqa: E402
+from music_player.ui import embeds as ui  # noqa: E402
 from music_player.audio import (  # noqa: E402
     FRAME_SIZE,
     BufferedAudioSource,
 )
 from music_player.state import GuildState, MusicState, Track  # noqa: E402
-from music_player.ytdl import (  # noqa: E402
+from music_player.services.youtube import (  # noqa: E402
+    ExtractionError,
     FetchResult,
     TrackInfo,
     _to_track,
@@ -471,19 +473,19 @@ class TestPreview(unittest.IsolatedAsyncioTestCase):
     """Behaviour that keeps autocomplete inside Discord's 3s window."""
 
     def setUp(self):
-        from music_player.ytdl import YouTubeService
+        from music_player.services.youtube import YouTubeService
 
         self.calls = []
         self.original = YouTubeService._extract
 
     def tearDown(self):
-        from music_player.ytdl import YouTubeService
+        from music_player.services.youtube import YouTubeService
 
         YouTubeService._extract = self.original
 
     def _patch(self, delay=0.0, result=None):
         import time as _time
-        from music_player.ytdl import YouTubeService
+        from music_player.services.youtube import YouTubeService
 
         calls = self.calls
 
@@ -496,7 +498,7 @@ class TestPreview(unittest.IsolatedAsyncioTestCase):
         YouTubeService._extract = staticmethod(fake)
 
     async def test_partial_input_never_touches_the_network(self):
-        from music_player.ytdl import YouTubeService
+        from music_player.services.youtube import YouTubeService
 
         self._patch()
         yt = YouTubeService()
@@ -505,7 +507,7 @@ class TestPreview(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.calls, [], "no extraction should have run")
 
     async def test_concurrent_keystrokes_share_one_extraction(self):
-        from music_player.ytdl import YouTubeService
+        from music_player.services.youtube import YouTubeService
 
         self._patch(delay=0.2)
         yt = YouTubeService()
@@ -514,7 +516,7 @@ class TestPreview(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(all(r == "Fake Song" for r in results))
 
     async def test_repeat_lookups_are_cached(self):
-        from music_player.ytdl import YouTubeService
+        from music_player.services.youtube import YouTubeService
 
         self._patch()
         yt = YouTubeService()
@@ -524,7 +526,7 @@ class TestPreview(unittest.IsolatedAsyncioTestCase):
 
     async def test_timeout_returns_none_but_keeps_working(self):
         """A slow lookup must not stall the response past Discord's window."""
-        from music_player.ytdl import YouTubeService
+        from music_player.services.youtube import YouTubeService
 
         self._patch(delay=0.4)
         yt = YouTubeService()
@@ -536,7 +538,7 @@ class TestPreview(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(self.calls), 1)
 
     async def test_playlist_preview_stops_after_first_entry(self):
-        from music_player.ytdl import YouTubeService
+        from music_player.services.youtube import YouTubeService
 
         self._patch(result={"title": "Popular Music Videos"})
         yt = YouTubeService()
@@ -546,7 +548,7 @@ class TestPreview(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(opts.get("playlist_items"), "1")
 
     async def test_extraction_failure_is_swallowed(self):
-        from music_player.ytdl import YouTubeService
+        from music_player.services.youtube import YouTubeService
 
         self._patch(result={})
         yt = YouTubeService()
@@ -648,7 +650,7 @@ class FakeYouTube:
         self.invalidated: list = []
 
     async def resolve_stream(self, url):
-        from music_player.ytdl import StreamInfo
+        from music_player.services.youtube import StreamInfo
 
         return StreamInfo(stream_url="https://stream", title="Song",
                           duration=10, thumbnail=None)
@@ -670,7 +672,7 @@ class TestPlayResponds(unittest.IsolatedAsyncioTestCase):
 
     def _player(self):
         from unittest.mock import MagicMock
-        from music_player.player import Player
+        from music_player.cogs.player import Player
 
         bot = MagicMock()
         bot.user = MagicMock()
@@ -686,7 +688,7 @@ class TestPlayResponds(unittest.IsolatedAsyncioTestCase):
 
     async def test_reply_goes_to_context_not_channel(self):
         from unittest.mock import MagicMock, patch
-        import music_player.player as mp
+        import music_player.cogs.player as mp
 
         player = self._player()
         state = self._state_with_track()
@@ -714,7 +716,7 @@ class TestPlayResponds(unittest.IsolatedAsyncioTestCase):
     async def test_play_command_always_answers(self):
         """Every branch of ?play must produce exactly one reply on ctx."""
         from unittest.mock import MagicMock, patch
-        import music_player.player as mp
+        import music_player.cogs.player as mp
 
         scenarios = {}
 
@@ -756,7 +758,7 @@ class TestPlayResponds(unittest.IsolatedAsyncioTestCase):
         channel = FakeChannel()
 
         from unittest.mock import MagicMock, patch
-        import music_player.player as mp
+        import music_player.cogs.player as mp
 
         with patch.object(mp.discord, "FFmpegPCMAudio", MagicMock()), \
              patch.object(mp.discord, "PCMVolumeTransformer", MagicMock()):
@@ -782,7 +784,7 @@ class TestThrottleMessages(unittest.IsolatedAsyncioTestCase):
 
     async def _handle(self, error):
         from discord.ext import commands
-        from music_player.player import Player
+        from music_player.cogs.player import Player
 
         ctx = FakeContext(FakeChannel())
         handled = await Player._handle_throttle(ctx, error)
@@ -815,7 +817,7 @@ class TestThrottleMessages(unittest.IsolatedAsyncioTestCase):
     def test_expensive_commands_are_throttled(self):
         """Guard against the decorators being dropped in a future edit."""
         import asyncio as _asyncio
-        from music_player.player import Player
+        from music_player.cogs.player import Player
 
         async def build():
             bot = MagicMock()
@@ -835,19 +837,19 @@ class TestSharedWork(unittest.IsolatedAsyncioTestCase):
     """N users wanting the same thing must cost one extraction, not N."""
 
     def setUp(self):
-        from music_player.ytdl import YouTubeService
+        from music_player.services.youtube import YouTubeService
 
         self.calls = []
         self.original = YouTubeService._extract
 
     def tearDown(self):
-        from music_player.ytdl import YouTubeService
+        from music_player.services.youtube import YouTubeService
 
         YouTubeService._extract = self.original
 
     def _patch(self, delay=0.0, ttl=21600):
         import time as _time
-        from music_player.ytdl import YouTubeService
+        from music_player.services.youtube import YouTubeService
 
         calls = self.calls
 
@@ -865,7 +867,7 @@ class TestSharedWork(unittest.IsolatedAsyncioTestCase):
         YouTubeService._extract = staticmethod(fake)
 
     def _service(self):
-        from music_player.ytdl import YouTubeService
+        from music_player.services.youtube import YouTubeService
 
         return YouTubeService()
 
@@ -912,7 +914,7 @@ class TestSharedWork(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(self.calls), 1)
 
     async def test_prefetch_failure_is_silent(self):
-        from music_player.ytdl import YouTubeService
+        from music_player.services.youtube import YouTubeService
 
         def boom(url, opts):
             raise RuntimeError("network down")
@@ -923,12 +925,12 @@ class TestSharedWork(unittest.IsolatedAsyncioTestCase):
         await asyncio.sleep(0.05)  # must not raise or warn
 
     def test_expiry_is_parsed_from_the_url(self):
-        from music_player.ytdl import _stream_expiry
+        from music_player.services.youtube import _stream_expiry
 
         self.assertEqual(_stream_expiry("https://gv/x?expire=1785680360"), 1785680360.0)
 
     def test_expiry_falls_back_when_absent(self):
-        from music_player.ytdl import _stream_expiry
+        from music_player.services.youtube import _stream_expiry
 
         self.assertGreater(_stream_expiry("https://gv/x"), time.time())
 
@@ -1037,7 +1039,7 @@ class TestConcurrency(unittest.IsolatedAsyncioTestCase):
 
     def _player(self, youtube=None):
         from unittest.mock import MagicMock
-        from music_player.player import Player
+        from music_player.cogs.player import Player
 
         bot = MagicMock()
         bot.user = MagicMock()
@@ -1056,7 +1058,7 @@ class TestConcurrency(unittest.IsolatedAsyncioTestCase):
     @staticmethod
     def _patched():
         from unittest.mock import MagicMock, patch
-        import music_player.player as mp
+        import music_player.cogs.player as mp
 
         return (
             patch.object(mp.discord, "FFmpegPCMAudio", MagicMock()),
@@ -1107,7 +1109,7 @@ class TestConcurrency(unittest.IsolatedAsyncioTestCase):
         The recursive _advance ran inside the try block, so `starting` was
         still set when _play_current re-entered and it bailed out silently.
         """
-        from music_player.ytdl import ExtractionError, StreamInfo
+        from music_player.services.youtube import ExtractionError, StreamInfo
 
         class PartlyDead(FakeYouTube):
             async def resolve_stream(self, url):
@@ -1130,7 +1132,7 @@ class TestConcurrency(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(state.starting)
 
     async def test_consecutive_dead_tracks_are_all_skipped(self):
-        from music_player.ytdl import ExtractionError, StreamInfo
+        from music_player.services.youtube import ExtractionError, StreamInfo
 
         class MostlyDead(FakeYouTube):
             async def resolve_stream(self, url):
@@ -1259,7 +1261,7 @@ class TestSilentSkip(unittest.IsolatedAsyncioTestCase):
 
     def _player(self, youtube=None):
         from unittest.mock import MagicMock
-        from music_player.player import Player
+        from music_player.cogs.player import Player
 
         bot = MagicMock()
         bot.user = MagicMock()
@@ -1281,7 +1283,7 @@ class TestSilentSkip(unittest.IsolatedAsyncioTestCase):
     @staticmethod
     def _patched():
         from unittest.mock import MagicMock, patch
-        import music_player.player as mp
+        import music_player.cogs.player as mp
 
         return (
             patch.object(mp.discord, "FFmpegPCMAudio", MagicMock()),
@@ -1291,27 +1293,27 @@ class TestSilentSkip(unittest.IsolatedAsyncioTestCase):
     # -- detection ------------------------------------------------------
 
     def test_instant_end_of_a_long_track_is_a_failure(self):
-        from music_player.player import Player
+        from music_player.cogs.player import Player
 
         state = self._state()
         self.assertTrue(Player._ended_early(state, state.current, 0.2))
 
     def test_a_finished_track_is_not_a_failure(self):
-        from music_player.player import Player
+        from music_player.cogs.player import Player
 
         state = self._state()
         self.assertFalse(Player._ended_early(state, state.current, 240.0))
 
     def test_a_user_skip_is_not_a_failure(self):
         """?skip ends a track early on purpose; retrying would fight the user."""
-        from music_player.player import Player
+        from music_player.cogs.player import Player
 
         state = self._state()
         state.skip_requested = True
         self.assertFalse(Player._ended_early(state, state.current, 0.2))
 
     def test_pause_is_not_a_failure(self):
-        from music_player.player import Player
+        from music_player.cogs.player import Player
 
         state = self._state()
         state.suppress_advance = True
@@ -1319,7 +1321,7 @@ class TestSilentSkip(unittest.IsolatedAsyncioTestCase):
 
     def test_very_short_tracks_are_not_judged(self):
         """A 3s clip legitimately ends in about 3s."""
-        from music_player.player import Player
+        from music_player.cogs.player import Player
 
         state = self._state(duration=3)
         self.assertFalse(Player._ended_early(state, state.current, 0.2))
@@ -1392,7 +1394,7 @@ class TestUnavailableCount(unittest.TestCase):
     """A playlist's dead entries are dropped; the user must hear about it."""
 
     def test_fetch_result_counts_dropped_entries(self):
-        from music_player.ytdl import FetchResult
+        from music_player.services.youtube import FetchResult
 
         self.assertEqual(FetchResult(entries=[]).unavailable, 0)
         self.assertEqual(
@@ -1400,7 +1402,7 @@ class TestUnavailableCount(unittest.TestCase):
         )
 
     def test_added_embed_reports_unavailable(self):
-        from music_player import ui
+        from music_player.ui import embeds as ui
 
         track = Track(WATCH, "Song", 10, 42, "t")
         embed = ui.added(track, extra_count=159, unavailable=39)
@@ -1409,14 +1411,14 @@ class TestUnavailableCount(unittest.TestCase):
         self.assertIn("-# Skipped 39 unavailable videos", embed.description)
 
     def test_a_single_dropped_video_is_not_pluralised(self):
-        from music_player import ui
+        from music_player.ui import embeds as ui
 
         track = Track(WATCH, "Song", 10, 42, "t")
         body = ui.added(track, extra_count=5, unavailable=1).description
         self.assertIn("1 unavailable video —", body)
 
     def test_added_embed_is_unchanged_when_nothing_was_dropped(self):
-        from music_player import ui
+        from music_player.ui import embeds as ui
 
         track = Track(WATCH, "Song", 10, 42, "t")
         self.assertNotIn("-#", ui.added(track, extra_count=5).description)
@@ -1556,7 +1558,7 @@ class TestHelpManual(unittest.TestCase):
         self.path.write_text(text, encoding="utf-8")
 
     def test_reloads_after_the_file_changes(self):
-        from music_player.help import HelpManual
+        from music_player.ui.manual import HelpManual
 
         self._touch("first version")
         manual = HelpManual(self.path)
@@ -1566,7 +1568,7 @@ class TestHelpManual(unittest.TestCase):
         self.assertEqual(manual.text(), "second version, longer")
 
     def test_unchanged_file_is_not_read_again(self):
-        from music_player.help import HelpManual
+        from music_player.ui.manual import HelpManual
 
         self._touch("stable text")
         manual = HelpManual(self.path)
@@ -1584,7 +1586,7 @@ class TestHelpManual(unittest.TestCase):
         self.assertEqual(calls, [], "a stat() should be enough when nothing changed")
 
     def test_missing_file_falls_back_and_recovers(self):
-        from music_player.help import HelpManual
+        from music_player.ui.manual import HelpManual
 
         manual = HelpManual(self.path)  # never created
         self.assertEqual(manual.text(), HelpManual.FALLBACK)
@@ -1593,7 +1595,7 @@ class TestHelpManual(unittest.TestCase):
         self.assertEqual(manual.text(), "now it exists")
 
     def test_blank_save_keeps_the_previous_text(self):
-        from music_player.help import HelpManual
+        from music_player.ui.manual import HelpManual
 
         self._touch("real content")
         manual = HelpManual(self.path)
@@ -1601,15 +1603,83 @@ class TestHelpManual(unittest.TestCase):
         self._touch("   \n  ")  # caught mid-edit
         self.assertEqual(manual.text(), "real content")
 
-    def test_shipped_manual_fits_in_an_embed(self):
+    def test_every_shipped_section_fits_in_an_embed(self):
+        """The 4096-char ceiling is per *page*, not per file.
+
+        The manual is browsable, so each section is its own embed and only the
+        landing page carries the intro as well. Asserting the whole file fits
+        one embed was the pre-browsing constraint; it now fails the moment the
+        manual grows past what any single page would ever show.
+        """
         from music_player.config import HELP_FILE
+        from music_player.ui.manual import build_embed, parse
 
         text = HELP_FILE.read_text(encoding="utf-8")
-        self.assertLessEqual(len(text), 4096, "Discord truncates past 4096 chars")
         self.assertTrue(text.strip())
 
+        intro, sections = parse(text)
+        for index, section in enumerate(sections):
+            rendered = build_embed(section, intro=intro if index == 0 else "")
+            self.assertLessEqual(
+                len(rendered.description),
+                4096,
+                f"the {section.name!r} page is past what Discord will show",
+            )
+            # build_embed clips rather than raising, so a page at exactly the
+            # limit has already lost its tail.
+            self.assertFalse(
+                rendered.description.endswith("…"),
+                f"the {section.name!r} page was truncated",
+            )
+
+    def test_the_shipped_manual_has_exactly_the_pages_we_expect(self):
+        """A bold-only line becomes a dropdown entry, which is easy to do by
+        accident: a sub-heading like ``**Every command:**`` silently splits its
+        section in two, and every size check still passes. Pinning the list is
+        what catches that.
+        """
+        from music_player.config import HELP_FILE
+        from music_player.ui.manual import parse
+
+        from music_player.ui.manual import split_icon
+
+        _intro, sections = parse(HELP_FILE.read_text(encoding="utf-8"))
+        self.assertEqual(
+            [split_icon(section.name)[1] for section in sections],
+            [
+                "Getting started",
+                "Playing music",
+                "Queue",
+                "Playlists",
+                "Buttons",
+                "Notes",
+            ],
+        )
+
+    def test_every_shipped_page_carries_an_icon(self):
+        """The dropdown shows them beside the label, so a bare page looks
+        broken next to the rest."""
+        from music_player.config import HELP_FILE
+        from music_player.ui.manual import parse, split_icon
+
+        _intro, sections = parse(HELP_FILE.read_text(encoding="utf-8"))
+        for section in sections:
+            icon, label = split_icon(section.name)
+            self.assertIsNotNone(icon, f"{section.name!r} has no icon")
+            self.assertTrue(label, f"{section.name!r} is only an icon")
+
+    def test_the_landing_page_points_at_playlists(self):
+        """?help opens on the first section; a feature never named there is a
+        feature most people never find."""
+        from music_player.config import HELP_FILE
+        from music_player.ui.manual import parse
+
+        intro, sections = parse(HELP_FILE.read_text(encoding="utf-8"))
+        landing = intro + sections[0].body
+        self.assertIn("?playlist", landing)
+
     def test_sections_are_reparsed_on_reload(self):
-        from music_player.help import HelpManual
+        from music_player.ui.manual import HelpManual
 
         self._touch("intro\n\n**One**\nbody one")
         manual = HelpManual(self.path)
@@ -1623,7 +1693,7 @@ class TestHelpParsing(unittest.TestCase):
     """help.txt drives the dropdown, so its headings must parse predictably."""
 
     def test_intro_and_sections_are_separated(self):
-        from music_player.help import parse
+        from music_player.ui.manual import parse
 
         intro, sections = parse(
             "Read me first.\n\n**Playback**\n- ?play\n\n**Queue**\n- ?queue\n"
@@ -1634,14 +1704,14 @@ class TestHelpParsing(unittest.TestCase):
 
     def test_a_line_that_merely_starts_bold_is_content(self):
         """`**?help** - display this list` is an entry, not a new category."""
-        from music_player.help import parse
+        from music_player.ui.manual import parse
 
         _, sections = parse("**Start**\n**`?help`** — Display this list.\n")
         self.assertEqual([s.name for s in sections], ["Start"])
         self.assertIn("?help", sections[0].body)
 
     def test_a_file_without_headings_renders_whole(self):
-        from music_player.help import parse
+        from music_player.ui.manual import parse
 
         intro, sections = parse("just a flat list of commands")
         self.assertEqual(intro, "")
@@ -1649,14 +1719,14 @@ class TestHelpParsing(unittest.TestCase):
         self.assertEqual(sections[0].body, "just a flat list of commands")
 
     def test_empty_sections_are_dropped(self):
-        from music_player.help import parse
+        from music_player.ui.manual import parse
 
         _, sections = parse("**Empty**\n\n**Real**\ncontent")
         self.assertEqual([s.name for s in sections], ["Real"])
 
     def test_shipped_manual_parses_into_categories(self):
         from music_player.config import HELP_FILE
-        from music_player.help import build_embed, parse
+        from music_player.ui.manual import build_embed, parse
 
         intro, sections = parse(HELP_FILE.read_text(encoding="utf-8"))
         self.assertTrue(intro, "the lead paragraph should stay out of the sections")
@@ -1675,7 +1745,7 @@ class TestHelpView(unittest.IsolatedAsyncioTestCase):
     def _manual(self, text=None):
         import tempfile
 
-        from music_player.help import HelpManual
+        from music_player.ui.manual import HelpManual
 
         d = tempfile.TemporaryDirectory()
         self.addCleanup(d.cleanup)
@@ -1684,14 +1754,14 @@ class TestHelpView(unittest.IsolatedAsyncioTestCase):
         return HelpManual(path)
 
     async def test_one_option_per_section(self):
-        from music_player.help import HelpView
+        from music_player.ui.manual import HelpView
 
         view = HelpView(self._manual(), user_id=7)
         select = view.children[0]
         self.assertEqual([o.label for o in select.options], ["One", "Two"])
 
     async def test_landing_page_carries_the_intro(self):
-        from music_player.help import HelpView
+        from music_player.ui.manual import HelpView
 
         view = HelpView(self._manual(), user_id=7)
         self.assertEqual(view.landing.title, "One")
@@ -1699,7 +1769,7 @@ class TestHelpView(unittest.IsolatedAsyncioTestCase):
         self.assertIn("body one", view.landing.description)
 
     async def test_a_single_section_gets_no_dropdown(self):
-        from music_player.help import HelpView
+        from music_player.ui.manual import HelpView
 
         view = HelpView(self._manual("flat text, no headings"), user_id=7)
         self.assertEqual(view.children, [], "nothing to choose between")
@@ -1707,7 +1777,7 @@ class TestHelpView(unittest.IsolatedAsyncioTestCase):
     async def test_choosing_swaps_the_page(self):
         from unittest.mock import AsyncMock
 
-        from music_player.help import HelpView
+        from music_player.ui.manual import HelpView
 
         view = HelpView(self._manual(), user_id=7)
         # Select.values reads a ContextVar set during a real interaction and
@@ -1726,7 +1796,7 @@ class TestHelpView(unittest.IsolatedAsyncioTestCase):
     async def test_another_user_is_turned_away(self):
         from unittest.mock import AsyncMock
 
-        from music_player.help import HelpView
+        from music_player.ui.manual import HelpView
 
         view = HelpView(self._manual(), user_id=7)
         interaction = MagicMock()
@@ -1737,7 +1807,7 @@ class TestHelpView(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(interaction.response.send_message.await_args.kwargs["ephemeral"])
 
     async def test_owner_is_let_through(self):
-        from music_player.help import HelpView
+        from music_player.ui.manual import HelpView
 
         view = HelpView(self._manual(), user_id=7)
         interaction = MagicMock()
@@ -1747,7 +1817,7 @@ class TestHelpView(unittest.IsolatedAsyncioTestCase):
     async def test_timeout_disables_the_menu(self):
         from unittest.mock import AsyncMock
 
-        from music_player.help import HelpView
+        from music_player.ui.manual import HelpView
 
         view = HelpView(self._manual(), user_id=7)
         view.message = MagicMock()
@@ -1759,7 +1829,7 @@ class TestHelpView(unittest.IsolatedAsyncioTestCase):
         view.message.edit.assert_awaited_once()
 
     async def test_timeout_without_a_message_is_harmless(self):
-        from music_player.help import HelpView
+        from music_player.ui.manual import HelpView
 
         view = HelpView(self._manual(), user_id=7)
         await view.on_timeout()  # must not raise
@@ -1817,44 +1887,130 @@ class TestTitleClipping(unittest.TestCase):
         self.assertIn(title, ui.track_link(Track(WATCH, title, 10, 1, "u")))
 
 
+class TestEmbedsFitDiscordsLimits(unittest.TestCase):
+    """Discord rejects an over-long embed outright with a 400.
+
+    The message never arrives and the traceback only shows up in the log
+    afterwards, so these are silent failures in production. Every field the
+    bot fills from a title it did not write is checked here.
+    """
+
+    HUGE = "M" * 4000
+    MARKDOWN = "[**`~~x~~`**](http://x) " * 200
+
+    def _track(self, title):
+        return Track("https://youtu.be/dQw4w9WgXcQ", title, 213, 1, "u")
+
+    def test_now_playing_clips_a_monstrous_title(self):
+        """It was the one builder passing the title through unclipped."""
+        rendered = ui.now_playing(
+            ui.NowPlaying(
+                title=self.HUGE, url="https://y/1", duration=213, thumbnail=None,
+                requester=None, volume=0.1, position=1, total=1, up_next=None,
+                remaining=213,
+            )
+        )
+        self.assertLessEqual(len(rendered.title), 256)
+
+    def test_skip_confirmations_bound_their_description(self):
+        """track_link() without a limit uses the title verbatim - fine inside
+        a bounded row, fatal when it *is* the description."""
+        track = self._track(self.MARKDOWN)
+        for rendered in (ui.skipped(track), ui.jumping_to(track)):
+            self.assertLessEqual(len(rendered.description), 4096)
+
+    def test_the_whole_embed_stays_under_the_total(self):
+        track = self._track(self.HUGE)
+        rendered = ui.now_playing(
+            ui.NowPlaying(
+                title=self.HUGE, url=track.url, duration=4000,
+                thumbnail=None, requester=None, volume=1.0, position=1,
+                total=50, up_next=track, remaining=200000, elapsed=1.0,
+                source=self.HUGE,
+            )
+        )
+        self.assertLessEqual(len(rendered), 6000)
+
+
+class TestClipKeepsMarkdownBalanced(unittest.TestCase):
+    """A clipped title goes inside ``[label](url)``.
+
+    One backup pass was not enough: a title can carry several unmatched
+    openers, and backing out of one pair can remove the closer that was
+    balancing the other.
+    """
+
+    @staticmethod
+    def _imbalance(text, opener, closer):
+        return max(0, text.count(opener) - text.count(closer))
+
+    def _assert_balanced(self, text, limit):
+        out = ui.clip(text, limit)
+        for opener, closer in (("[", "]"), ("(", ")")):
+            self.assertLessEqual(
+                self._imbalance(out, opener, closer),
+                self._imbalance(text, opener, closer),
+                f"clip({text!r}, {limit}) -> {out!r}",
+            )
+
+    def test_several_unmatched_openers_are_all_backed_out_of(self):
+        self._assert_balanced("[a[bcdefghijkl", 10)
+
+    def test_fixing_one_pair_does_not_break_the_other(self):
+        """Cutting back past ( took away the ] balancing an earlier [."""
+        self._assert_balanced("[a](bcdefghij", 10)
+
+    def test_a_title_that_is_nothing_but_openers(self):
+        self._assert_balanced("[[[[[[[[[[[[abc", 10)
+        self._assert_balanced("((((((((((((abc", 10)
+
+    def test_a_realistic_title_cut_mid_bracket(self):
+        self._assert_balanced("Song Name (Official Video) [4K Remaster]", 20)
+
+    def test_it_still_never_exceeds_the_limit(self):
+        for text in ("[a[bcdefghijkl", "[a](bcdefghij", "[[[[[abc", "plain"):
+            for limit in (2, 10, 45, 256):
+                self.assertLessEqual(len(ui.clip(text, limit)), limit)
+
+
 class TestVideoId(unittest.TestCase):
     """Artwork is derived from the id, so a wrong id means a broken image."""
 
     def test_watch_url(self):
-        from music_player.ytdl import video_id
+        from music_player.services.youtube import video_id
         self.assertEqual(video_id(WATCH), VIDEO)
 
     def test_short_link(self):
-        from music_player.ytdl import video_id
+        from music_player.services.youtube import video_id
         self.assertEqual(video_id(f"https://youtu.be/{VIDEO}"), VIDEO)
 
     def test_shorts_and_embed_paths(self):
-        from music_player.ytdl import video_id
+        from music_player.services.youtube import video_id
         for path in ("shorts", "embed", "live", "v"):
             self.assertEqual(
                 video_id(f"https://www.youtube.com/{path}/{VIDEO}"), VIDEO, path
             )
 
     def test_music_subdomain(self):
-        from music_player.ytdl import video_id
+        from music_player.services.youtube import video_id
         self.assertEqual(video_id(f"https://music.youtube.com/watch?v={VIDEO}"), VIDEO)
 
     def test_playlist_ride_along_is_ignored(self):
-        from music_player.ytdl import video_id
+        from music_player.services.youtube import video_id
         self.assertEqual(video_id(f"{WATCH}&list={LIST}"), VIDEO)
 
     def test_a_wrong_length_id_is_rejected(self):
         """Better no image than a request for a video that doesn't exist."""
-        from music_player.ytdl import video_id
+        from music_player.services.youtube import video_id
         self.assertIsNone(video_id("https://www.youtube.com/watch?v=short"))
 
     def test_non_youtube_hosts_are_rejected(self):
-        from music_player.ytdl import video_id
+        from music_player.services.youtube import video_id
         self.assertIsNone(video_id(f"https://example.com/watch?v={VIDEO}"))
         self.assertIsNone(video_id(f"https://notyoutube.com/watch?v={VIDEO}"))
 
     def test_bare_playlist_url_has_no_video(self):
-        from music_player.ytdl import video_id
+        from music_player.services.youtube import video_id
         self.assertIsNone(video_id(f"https://www.youtube.com/playlist?list={LIST}"))
 
 
@@ -1916,7 +2072,9 @@ class TestTracksAreClickable(unittest.TestCase):
         self.assertIn(f"](<{WATCH}>)", ui.jumping_to(self._track()).description)
 
     def test_skip_without_a_track_does_not_break(self):
-        self.assertIn("Skipped", ui.skipped(None).description)
+        rendered = ui.skipped(None)
+        self.assertEqual(rendered.author.name, "Skipped")
+        self.assertIn("Nothing was playing", rendered.description)
 
     def test_queue_rows_link_every_song(self):
         tracks = [Track(f"https://y/{i}", f"Song {i}", 60, 1, "u") for i in range(3)]
@@ -1991,8 +2149,8 @@ class TestAddCommandWiring(unittest.IsolatedAsyncioTestCase):
         return ctx
 
     def _player(self, entries, playlist_title=None, unavailable=0):
-        from music_player.player import Player
-        from music_player.ytdl import FetchResult, TrackInfo
+        from music_player.cogs.player import Player
+        from music_player.services.youtube import FetchResult, TrackInfo
 
         youtube = FakeYouTube()
 
@@ -2121,12 +2279,18 @@ class TestPlaybackLine(unittest.TestCase):
 
     NOW = 1_700_000_000
 
-    def test_a_just_started_track_shows_no_bar(self):
-        """A bar posted at 0:00 stays at 0:00 for the whole song."""
-        line = ui.playback_line(0, 213, now=self.NOW)
-        self.assertNotIn("▰", line)
-        self.assertNotIn("▱", line)
-        self.assertIn("3:33", line)
+    def test_a_just_started_track_shows_an_empty_bar(self):
+        """Drawn from the first frame, the way a music player draws one.
+
+        It used to be withheld until there was progress, so a message
+        scrolled past later would not show an empty gauge. Repainting on
+        every pause and freezing what is no longer maintained covers that
+        now, and 0:00 against the length is the plainer statement.
+        """
+        line = ui.playback_line(0, 213)
+        self.assertIn(ui._BAR_EMPTY * 14, line)
+        self.assertIn("0:00 / 3:33", line)
+        self.assertNotIn(ui._BAR_FILLED, line)
 
     def test_a_track_in_progress_shows_the_bar(self):
         line = ui.playback_line(83, 213, now=self.NOW)
@@ -2226,6 +2390,252 @@ class TestNowPlayingEmbed(unittest.TestCase):
         self.assertNotIn("left", embed.footer.text)
 
 
+class TestTheCountdownNeverLies(unittest.IsolatedAsyncioTestCase):
+    """"Ends in 2 minutes" is rendered by the Discord client, not by us.
+
+    It counts down to an absolute instant with no idea the audio was paused,
+    so it is only true while something is repainting the message. These pin
+    the two halves of that: it corrects itself while the view is alive, and
+    it is taken away the moment the view stops.
+    """
+
+    def _rig(self):
+        from music_player.ui.views import PlayerControls
+
+        state = GuildState(1)
+        state.voice = FakeVoice()
+        state.voice.playing = True
+        state.mark_started()
+        snapshot = ui.NowPlaying(
+            title="A Song", url="https://y/1", duration=213, thumbnail=None,
+            requester=None, volume=0.1, position=1, total=12, up_next=None,
+            remaining=2500,
+        )
+        view = PlayerControls(MagicMock(), state, snapshot)
+        view.message = AsyncMock()
+        return state, view
+
+    @staticmethod
+    def _age(state, seconds):
+        """Wall time passing: every absolute stamp gets that much older."""
+        state.playback_started -= seconds
+        if state.paused_at is not None:
+            state.paused_at -= seconds
+
+    @staticmethod
+    def _stamp(embed):
+        found = re.search(r"<t:(\d+):R>", embed.description or "")
+        return int(found.group(1)) if found else None
+
+    async def test_a_pause_takes_the_countdown_away(self):
+        state, view = self._rig()
+        self._age(state, 30)
+        self.assertIsNotNone(self._stamp(view.render()))
+
+        state.voice.pause()
+        state.mark_paused()
+        self.assertIsNone(self._stamp(view.render()))
+
+    async def test_resuming_recomputes_it_from_where_the_song_really_is(self):
+        state, view = self._rig()
+        self._age(state, 30)
+        state.voice.pause()
+        state.mark_paused()
+        self._age(state, 120)  # two minutes go by, paused
+        state.voice.resume()
+        state.mark_resumed()
+
+        # 30s of a 213s song has been heard, so 183s remain - the two minutes
+        # spent paused must not have eaten into it.
+        remaining = self._stamp(view.render()) - int(time.time())
+        self.assertAlmostEqual(remaining, 183, delta=2)
+        self.assertAlmostEqual(state.elapsed, 30, delta=1)
+
+    async def test_the_pause_button_records_who_pressed_it(self):
+        """The buttons edit the card instead of replying, so this is the only
+        place the channel can learn who stopped the music."""
+        from music_player.cogs.player import Player
+
+        state, view = self._rig()
+        view.cog = Player(MagicMock(), MusicState(), FakeYouTube())
+        self._age(state, 30)
+
+        class _Response:
+            async def edit_message(self, **kwargs):
+                pass
+
+        interaction = MagicMock()
+        interaction.user = FakeUser(1, "tan")
+        interaction.response = _Response()
+
+        await view.toggle.callback(interaction)
+        self.addCleanup(state.cancel_idle_disconnect)
+        self.assertEqual(view.render().author.name, "Paused by tan")
+
+        await view.toggle.callback(interaction)
+        self.assertEqual(view.render().author.name, "Now playing")
+
+    async def test_a_retired_message_stops_counting(self):
+        """Nothing will repaint it again, so it must stop claiming to be live."""
+        state, view = self._rig()
+        self._age(state, 30)
+        await view.retire()
+
+        posted = view.message.edit.await_args.kwargs["embed"]
+        self.assertIsNone(self._stamp(posted))
+        self.assertIn("no longer updating", posted.footer.text)
+
+    async def test_a_timed_out_message_stops_counting(self):
+        state, view = self._rig()
+        self._age(state, 30)
+        await view.on_timeout()
+
+        posted = view.message.edit.await_args.kwargs["embed"]
+        self.assertIsNone(self._stamp(posted))
+
+    async def test_freezing_still_greys_the_buttons(self):
+        """The embed change must not have cost the thing fade() already did."""
+        _state, view = self._rig()
+        await view.retire()
+        self.assertTrue(all(child.disabled for child in view.children))
+        self.assertTrue(view.is_finished())
+
+    async def test_the_progress_bar_survives_freezing(self):
+        """Only the part that would keep moving is removed."""
+        state, view = self._rig()
+        self._age(state, 30)
+        await view.retire()
+        posted = view.message.edit.await_args.kwargs["embed"]
+        self.assertIn("0:30 / 3:33", posted.description)
+
+
+class TestPauseAndResume(unittest.TestCase):
+    """Pausing starts a countdown to leaving, so it has to say so."""
+
+    TRACK = Track(
+        "https://www.youtube.com/watch?v=dQw4w9WgXcQ", "A Song", 213, 1, "tan"
+    )
+
+    def test_pausing_names_the_song_and_where_it_stopped(self):
+        rendered = ui.paused(self.TRACK, 75.0)
+        self.assertEqual(rendered.title, "A Song")
+        self.assertEqual(rendered.url, self.TRACK.url)
+        self.assertIn("1:15 / 3:33", rendered.description)
+
+    def test_pausing_says_how_to_pick_it_back_up(self):
+        self.assertIn("?resume", ui.paused(self.TRACK, 75.0).description)
+
+    def test_pausing_warns_that_the_bot_will_leave(self):
+        """apply_pause schedules the idle disconnect; an unwarned listener
+        comes back to an empty channel and assumes it crashed."""
+        self.assertIn("leave the channel", ui.paused(self.TRACK, 75.0).footer.text)
+
+    def test_a_bot_that_never_leaves_makes_no_promise_about_it(self):
+        self.assertIsNone(ui.paused(self.TRACK, 75.0, leaves_in=0).footer.text)
+
+    def test_a_paused_track_gets_no_countdown(self):
+        """The finish time would keep running against audio that is stopped."""
+        self.assertNotIn("Ends <t:", ui.paused(self.TRACK, 75.0).description)
+
+    def test_resuming_brings_the_finish_time_back(self):
+        rendered = ui.resumed(self.TRACK, 75.0)
+        self.assertEqual(rendered.title, "A Song")
+        self.assertIn("Ends <t:", rendered.description)
+
+    def test_pausing_at_the_very_start_still_shows_the_length(self):
+        line = ui.paused(self.TRACK, 0.0).description
+        self.assertIn("0:00 / 3:33", line)
+
+    def test_both_carry_the_songs_cover(self):
+        for rendered in (ui.paused(self.TRACK, 75.0), ui.resumed(self.TRACK, 75.0)):
+            self.assertIn("dQw4w9WgXcQ", rendered.thumbnail.url)
+
+    def test_a_link_with_no_derivable_cover_still_renders(self):
+        """artwork() only knows YouTube ids; anything else gets no picture."""
+        track = Track("https://example.com/audio", "Something Else", 200, 1, "u")
+        for rendered in (ui.paused(track, 40.0), ui.resumed(track, 40.0)):
+            self.assertIsNone(rendered.thumbnail.url)
+            self.assertEqual(rendered.title, "Something Else")
+
+    def test_both_name_whoever_did_it(self):
+        who = FakeUser(1, "tan")
+        self.assertEqual(ui.paused(self.TRACK, 75.0, by=who).author.name, "Paused by tan")
+        self.assertEqual(
+            ui.resumed(self.TRACK, 75.0, by=who).author.name, "Resumed by tan"
+        )
+
+    def test_the_eyebrow_carries_their_avatar(self):
+        who = FakeUser(1, "tan")
+        self.assertIsNotNone(ui.paused(self.TRACK, 75.0, by=who).author.icon_url)
+
+    def test_the_label_falls_back_when_nobody_is_recorded(self):
+        self.assertEqual(ui.paused(self.TRACK, 75.0).author.name, "Paused")
+        self.assertIsNone(ui.paused(self.TRACK, 75.0).author.icon_url)
+
+    def test_both_still_render_without_a_track(self):
+        self.assertIn("Paused", ui.paused().description)
+        self.assertIn("Resumed", ui.resumed().description)
+
+
+class TestSkipSaysWhoDidIt(unittest.IsolatedAsyncioTestCase):
+    """A song vanishing is the thing a channel most wants attributed."""
+
+    TRACK = Track("https://youtu.be/dQw4w9WgXcQ", "A Song", 213, 1, "sam")
+
+    def test_the_command_names_the_skipper(self):
+        rendered = ui.skipped(self.TRACK, by=FakeUser(1, "tan"))
+        self.assertEqual(rendered.author.name, "Skipped by tan")
+        self.assertIsNotNone(rendered.author.icon_url)
+
+    def test_skipto_reads_as_a_skip_too(self):
+        rendered = ui.jumping_to(self.TRACK, by=FakeUser(1, "tan"))
+        self.assertEqual(rendered.author.name, "Skipped ahead by tan")
+
+    def test_the_song_is_still_linked(self):
+        rendered = ui.skipped(self.TRACK, by=FakeUser(1, "tan"))
+        self.assertIn(f"(<{self.TRACK.url}>)", rendered.description)
+
+    def test_it_falls_back_when_nobody_is_recorded(self):
+        self.assertEqual(ui.skipped(self.TRACK).author.name, "Skipped")
+
+    def test_the_skipped_song_gets_no_artwork(self):
+        """The next song's Now Playing card follows immediately; the wrong
+        cover directly above the right one would just confuse."""
+        self.assertIsNone(ui.skipped(self.TRACK, by=FakeUser()).thumbnail.url)
+
+    async def test_the_skip_button_names_whoever_pressed_it(self):
+        from music_player.ui.views import PlayerControls
+        from music_player.cogs.player import Player
+
+        state = GuildState(1)
+        state.voice = FakeVoice()
+        state.voice.playing = True
+        state.queue.append(self.TRACK)
+        state.mark_started()
+
+        snapshot = ui.NowPlaying(
+            title="A Song", url="https://y/1", duration=213, thumbnail=None,
+            requester=None, volume=0.1, position=1, total=1, up_next=None,
+            remaining=213,
+        )
+        view = PlayerControls(
+            Player(MagicMock(), MusicState(), FakeYouTube()), state, snapshot
+        )
+        view.message = AsyncMock()
+
+        interaction = MagicMock()
+        interaction.user = FakeUser(1, "tan")
+        interaction.channel = FakeChannel()
+        interaction.response = AsyncMock()
+        interaction.followup = AsyncMock()
+
+        await view.skip.callback(interaction)
+        self.addCleanup(state.cancel_idle_disconnect)
+
+        posted = interaction.followup.send.await_args.kwargs["embed"]
+        self.assertEqual(posted.author.name, "Skipped by tan")
+
+
 class TestVolumeMeter(unittest.TestCase):
     def test_meter_tracks_the_number(self):
         self.assertEqual(ui.volume_set(0).description.count("▰"), 0)
@@ -2306,8 +2716,8 @@ class TestElapsedTracking(unittest.TestCase):
 
 class TestQueuePagesView(unittest.IsolatedAsyncioTestCase):
     def _view(self, count, page=1):
-        from music_player.controls import QueuePages
-        from music_player.player import Player
+        from music_player.ui.views import QueuePages
+        from music_player.cogs.player import Player
 
         player = Player(MagicMock(), MusicState(), FakeYouTube())
         state = GuildState(1)
@@ -2367,8 +2777,8 @@ class TestQueuePagesView(unittest.IsolatedAsyncioTestCase):
 
 class TestPlayerControlsView(unittest.IsolatedAsyncioTestCase):
     def _view(self):
-        from music_player.controls import PlayerControls
-        from music_player.player import Player
+        from music_player.ui.views import PlayerControls
+        from music_player.cogs.player import Player
 
         player = Player(MagicMock(), MusicState(), FakeYouTube())
         state = GuildState(1)
@@ -2440,7 +2850,7 @@ class TestSharedActions(unittest.IsolatedAsyncioTestCase):
     """A button press and a command must not be able to drift apart."""
 
     def _player_state(self):
-        from music_player.player import Player
+        from music_player.cogs.player import Player
 
         player = Player(MagicMock(), MusicState(), FakeYouTube())
         state = GuildState(1)
@@ -2482,7 +2892,7 @@ class TestSharedActions(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(state._idle_task)
 
     async def test_status_marker_follows_playback(self):
-        from music_player.player import Player
+        from music_player.cogs.player import Player
 
         state = GuildState(1)
         self.assertEqual(Player.status_marker(state), "")
@@ -2696,23 +3106,23 @@ class TestFfmpegIsLogged(unittest.TestCase):
         self.addCleanup(logging.disable, logging.CRITICAL)
 
     def test_ffmpeg_stderr_is_routed_into_logging(self):
-        from music_player.player import _FFmpegLog
+        from music_player.cogs.player import _FFmpegLog
 
         sink = _FFmpegLog("https://youtube.com/watch?v=x")
-        with self.assertLogs("music_player.player", level="WARNING") as caught:
+        with self.assertLogs("music_player.cogs.player", level="WARNING") as caught:
             sink.write(b"[tcp @ 0x1] Failed to resolve hostname rr3---sn-x\n")
         self.assertIn("Failed to resolve hostname", caught.output[0])
 
     def test_the_sink_has_no_fileno(self):
         """That absence is how discord.py decides to pipe stderr to us at all."""
-        from music_player.player import _FFmpegLog
+        from music_player.cogs.player import _FFmpegLog
 
         self.assertFalse(hasattr(_FFmpegLog("u"), "fileno"))
 
     def test_blank_ffmpeg_output_is_not_logged(self):
-        from music_player.player import _FFmpegLog
+        from music_player.cogs.player import _FFmpegLog
 
-        logger = logging.getLogger("music_player.player")
+        logger = logging.getLogger("music_player.cogs.player")
         with patch.object(logger, "warning") as warned:
             _FFmpegLog("u").write(b"   \n")
         warned.assert_not_called()
@@ -2838,3 +3248,1565 @@ class TestLogContext(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+
+
+# ---------------------------------------------------------------------------
+# Saved playlists
+# ---------------------------------------------------------------------------
+
+import json  # noqa: E402
+import sqlite3  # noqa: E402
+
+from discord.ext import commands  # noqa: E402
+
+from music_player.config import (  # noqa: E402
+    MAX_PLAYLIST_TRACKS,
+    MAX_PLAYLISTS_PER_GUILD,
+)
+from music_player.services.library import (  # noqa: E402
+    InvalidName,
+    NoSuchPlaylist,
+    NoSuchSong,
+    Playlist,
+    PlaylistExists,
+    PlaylistFull,
+    PlaylistLibrary,
+    SavedTrack,
+    StorageError,
+    TooManyPlaylists,
+    fold,
+    normalise_name,
+)
+
+#: The guild every cog test acts in. Playlists are keyed by guild id, so a bare
+#: int in these tests is always a server, never a person.
+GUILD = 1
+OTHER_GUILD = 2
+
+
+class FakePermissions:
+    def __init__(self, manage_guild: bool = False) -> None:
+        self.manage_guild = manage_guild
+
+
+class FakeGuild:
+    def __init__(self, gid: int = GUILD, name: str = "Test Server") -> None:
+        self.id = gid
+        self.name = name
+        self.icon = None
+
+
+class FakeUser:
+    """Stands in for a discord.Member / discord.User."""
+
+    def __init__(
+        self, uid: int = 42, name: str = "tester", *, manage_guild: bool = False
+    ) -> None:
+        self.id = uid
+        self.name = name
+        self.display_name = name
+        self.avatar = None
+        self.guild_permissions = FakePermissions(manage_guild)
+
+
+class FakeResponse:
+    def __init__(self) -> None:
+        self.messages: list = []
+        self.edits: list = []
+        self.deferred = False
+
+    async def send_message(self, **kwargs):
+        self.messages.append(kwargs)
+
+    async def edit_message(self, **kwargs):
+        self.edits.append(kwargs)
+
+    async def defer(self, **kwargs):
+        self.deferred = True
+
+
+class FakeInteraction:
+    """Stands in for a component interaction on a view."""
+
+    def __init__(self, user: FakeUser, channel, guild_id=GUILD) -> None:
+        self.user = user
+        self.channel = channel
+        self.guild = FakeGuild(guild_id) if guild_id else None
+        self.response = FakeResponse()
+
+
+def _saved(count: int, *, seconds: int = 60) -> list:
+    return [
+        SavedTrack(f"https://youtu.be/{i:011d}", f"Song {i}", seconds)
+        for i in range(count)
+    ]
+
+
+def _fresh_db() -> Path:
+    return Path(tempfile.mkdtemp(prefix="playlist-test-")) / "sub" / "playlists.db"
+
+
+class TestPlaylistNames(unittest.TestCase):
+    """Names are shown as typed but matched loosely, so the two must agree."""
+
+    def test_surrounding_and_repeated_whitespace_is_collapsed(self):
+        self.assertEqual(normalise_name("  Late   Night  "), "Late Night")
+
+    def test_a_newline_cannot_survive_into_an_embed(self):
+        self.assertEqual(normalise_name("Late\nNight"), "Late Night")
+
+    def test_an_empty_name_is_refused(self):
+        with self.assertRaises(InvalidName) as caught:
+            normalise_name("   ")
+        self.assertEqual(caught.exception.reason, "empty")
+
+    def test_an_overlong_name_is_refused(self):
+        with self.assertRaises(InvalidName) as caught:
+            normalise_name("x" * 500)
+        self.assertEqual(caught.exception.reason, "long")
+
+    def test_matching_ignores_case(self):
+        self.assertEqual(fold("Late Night"), fold("LATE night"))
+
+    def test_the_two_agree_on_collapsed_whitespace(self):
+        """?playlist play "late  night" has to find "Late Night"."""
+        self.assertEqual(fold(normalise_name("late  night")), fold("Late Night"))
+
+
+class TestPlaylistLibrary(unittest.IsolatedAsyncioTestCase):
+    """What a server may and may not do to its own playlists."""
+
+    def setUp(self):
+        self.path = _fresh_db()
+        self.library = PlaylistLibrary(self.path)
+
+    def tearDown(self):
+        self.library.close()
+
+    async def test_a_new_library_is_empty(self):
+        self.assertEqual(await self.library.summaries(GUILD), [])
+
+    async def test_create_then_find_is_case_insensitive(self):
+        await self.library.create(GUILD, "Late Night")
+        self.assertIsNotNone(await self.library.find(GUILD, "LATE NIGHT"))
+
+    async def test_the_name_is_kept_as_it_was_typed(self):
+        await self.library.create(GUILD, "Late Night")
+        found = await self.library.find(GUILD, "late night")
+        self.assertEqual(found.name, "Late Night")
+
+    async def test_playlists_belong_to_one_server_only(self):
+        """A playlist made in server A must not exist in server B."""
+        await self.library.create(GUILD, "Ours")
+        self.assertIsNone(await self.library.find(OTHER_GUILD, "Ours"))
+        self.assertEqual(await self.library.summaries(OTHER_GUILD), [])
+
+    async def test_two_servers_may_use_the_same_name(self):
+        await self.library.create(GUILD, "Mix")
+        await self.library.create(OTHER_GUILD, "Mix")
+        await self.library.extend(GUILD, "Mix", _saved(2))
+        self.assertEqual(len((await self.library.find(GUILD, "Mix")).tracks), 2)
+        self.assertEqual(len((await self.library.find(OTHER_GUILD, "Mix")).tracks), 0)
+
+    async def test_a_duplicate_name_is_refused(self):
+        await self.library.create(GUILD, "Mix")
+        with self.assertRaises(PlaylistExists):
+            await self.library.create(GUILD, "  mix  ")
+
+    async def test_the_duplicate_check_beats_the_limit_check(self):
+        """At the cap, "pick another name" is still the useful answer."""
+        for index in range(MAX_PLAYLISTS_PER_GUILD):
+            await self.library.create(GUILD, f"P{index}")
+        with self.assertRaises(PlaylistExists):
+            await self.library.create(GUILD, "p0")
+
+    async def test_the_playlist_limit_is_enforced(self):
+        for index in range(MAX_PLAYLISTS_PER_GUILD):
+            await self.library.create(GUILD, f"P{index}")
+        with self.assertRaises(TooManyPlaylists):
+            await self.library.create(GUILD, "one too many")
+
+    async def test_the_limit_is_per_server(self):
+        for index in range(MAX_PLAYLISTS_PER_GUILD):
+            await self.library.create(GUILD, f"P{index}")
+        await self.library.create(OTHER_GUILD, "Plenty of room")  # must not raise
+
+    async def test_a_refused_create_leaves_no_trace(self):
+        with self.assertRaises(InvalidName):
+            await self.library.create(GUILD, "  ")
+        self.assertEqual(await self.library.summaries(GUILD), [])
+
+    async def test_the_creator_is_recorded(self):
+        playlist = await self.library.create(GUILD, "Mix", created_by=99)
+        self.assertEqual(playlist.created_by, 99)
+
+    async def test_extend_reports_what_it_added(self):
+        await self.library.create(GUILD, "Mix")
+        playlist, added = await self.library.extend(GUILD, "Mix", _saved(3))
+        self.assertEqual(added, 3)
+        self.assertEqual(len(playlist.tracks), 3)
+
+    async def test_extend_returns_the_playlist_as_it_now_is(self):
+        """The confirmation quotes this, so a stale copy would misreport."""
+        await self.library.create(GUILD, "Mix")
+        await self.library.extend(GUILD, "Mix", _saved(2))
+        playlist, _added = await self.library.extend(GUILD, "Mix", _saved(3))
+        self.assertEqual(len(playlist.tracks), 5)
+
+    async def test_songs_keep_the_order_they_were_added_in(self):
+        await self.library.create(GUILD, "Mix")
+        await self.library.extend(GUILD, "Mix", _saved(3))
+        playlist, _ = await self.library.extend(
+            GUILD, "Mix", [SavedTrack("https://y/last", "Last", 10)]
+        )
+        self.assertEqual(
+            [t.title for t in playlist.tracks],
+            ["Song 0", "Song 1", "Song 2", "Last"],
+        )
+
+    async def test_extend_takes_what_fits_rather_than_refusing(self):
+        await self.library.create(GUILD, "Mix")
+        await self.library.extend(GUILD, "Mix", _saved(MAX_PLAYLIST_TRACKS - 2))
+        playlist, added = await self.library.extend(GUILD, "Mix", _saved(10))
+        self.assertEqual(added, 2)
+        self.assertEqual(len(playlist.tracks), MAX_PLAYLIST_TRACKS)
+
+    async def test_a_full_playlist_refuses_outright(self):
+        await self.library.create(GUILD, "Mix")
+        await self.library.extend(GUILD, "Mix", _saved(MAX_PLAYLIST_TRACKS))
+        with self.assertRaises(PlaylistFull):
+            await self.library.extend(GUILD, "Mix", _saved(1))
+
+    async def test_remove_uses_the_numbers_the_listing_prints(self):
+        await self.library.create(GUILD, "Mix")
+        await self.library.extend(GUILD, "Mix", _saved(3))
+        playlist, removed = await self.library.remove_at(GUILD, "Mix", 2)
+        self.assertEqual(removed.title, "Song 1")
+        self.assertEqual([t.title for t in playlist.tracks], ["Song 0", "Song 2"])
+
+    async def test_removing_a_number_that_is_not_there(self):
+        await self.library.create(GUILD, "Mix")
+        await self.library.extend(GUILD, "Mix", _saved(2))
+        with self.assertRaises(NoSuchSong) as caught:
+            await self.library.remove_at(GUILD, "Mix", 5)
+        self.assertEqual((caught.exception.asked, caught.exception.total), (5, 2))
+
+    async def test_zero_is_not_a_song_number(self):
+        await self.library.create(GUILD, "Mix")
+        await self.library.extend(GUILD, "Mix", _saved(2))
+        with self.assertRaises(NoSuchSong):
+            await self.library.remove_at(GUILD, "Mix", 0)
+
+    async def test_renaming_to_a_different_capitalisation_is_allowed(self):
+        """Renaming a playlist onto its own key is a fix, not a collision."""
+        await self.library.create(GUILD, "chill")
+        await self.library.rename(GUILD, "chill", "Chill")
+        self.assertEqual((await self.library.find(GUILD, "CHILL")).name, "Chill")
+
+    async def test_renaming_onto_another_playlist_is_refused(self):
+        await self.library.create(GUILD, "One")
+        await self.library.create(GUILD, "Two")
+        with self.assertRaises(PlaylistExists):
+            await self.library.rename(GUILD, "One", "two")
+        self.assertIsNotNone(await self.library.find(GUILD, "One"))
+
+    async def test_renaming_keeps_the_songs(self):
+        await self.library.create(GUILD, "One")
+        await self.library.extend(GUILD, "One", _saved(3))
+        renamed = await self.library.rename(GUILD, "One", "Two")
+        self.assertEqual(len(renamed.tracks), 3)
+
+    async def test_delete_removes_it(self):
+        await self.library.create(GUILD, "Mix")
+        await self.library.delete(GUILD, "mix")
+        self.assertEqual(await self.library.summaries(GUILD), [])
+
+    async def test_delete_returns_the_playlist_as_it_was(self):
+        await self.library.create(GUILD, "Mix")
+        await self.library.extend(GUILD, "Mix", _saved(3))
+        deleted = await self.library.delete(GUILD, "Mix")
+        self.assertEqual(len(deleted.tracks), 3)
+
+    async def test_every_operation_names_a_playlist_that_is_not_there(self):
+        for call in (
+            self.library.require(GUILD, "ghost"),
+            self.library.delete(GUILD, "ghost"),
+            self.library.rename(GUILD, "ghost", "new"),
+            self.library.extend(GUILD, "ghost", _saved(1)),
+            self.library.remove_at(GUILD, "ghost", 1),
+        ):
+            with self.assertRaises(NoSuchPlaylist):
+                await call
+
+
+class TestTheSchemaHoldsTheInvariants(unittest.IsolatedAsyncioTestCase):
+    """The rules that used to be Python are now the database's job.
+
+    These reach into the connection on purpose: the point is that the *tables*
+    enforce this, not the code above them.
+    """
+
+    def setUp(self):
+        self.library = PlaylistLibrary(_fresh_db())
+
+    def tearDown(self):
+        self.library.close()
+
+    def _count(self, sql, *args):
+        return self.library._db.execute(sql, args).fetchone()[0]
+
+    async def test_two_playlists_cannot_share_a_folded_name(self):
+        await self.library.create(GUILD, "Chill")
+        with self.assertRaises(sqlite3.IntegrityError):
+            with self.library._db:
+                self.library._db.execute(
+                    "INSERT INTO playlists "
+                    "(guild_id, name, name_key, created_at, updated_at) "
+                    "VALUES (?, ?, ?, 0, 0)",
+                    (GUILD, "CHILL", fold("CHILL")),
+                )
+
+    async def test_deleting_a_playlist_takes_its_songs_with_it(self):
+        """ON DELETE CASCADE, rather than a second statement we might forget."""
+        await self.library.create(GUILD, "Mix")
+        await self.library.extend(GUILD, "Mix", _saved(5))
+        self.assertEqual(self._count("SELECT COUNT(*) FROM tracks"), 5)
+
+        await self.library.delete(GUILD, "Mix")
+        self.assertEqual(self._count("SELECT COUNT(*) FROM tracks"), 0)
+
+    async def test_positions_stay_contiguous_after_a_removal(self):
+        """The gap is closed, or the next insert collides with a stale index."""
+        await self.library.create(GUILD, "Mix")
+        await self.library.extend(GUILD, "Mix", _saved(5))
+        await self.library.remove_at(GUILD, "Mix", 2)
+
+        positions = [
+            row[0]
+            for row in self.library._db.execute(
+                "SELECT position FROM tracks ORDER BY position"
+            )
+        ]
+        self.assertEqual(positions, [0, 1, 2, 3])
+
+    async def test_adding_after_a_removal_does_not_collide(self):
+        await self.library.create(GUILD, "Mix")
+        await self.library.extend(GUILD, "Mix", _saved(5))
+        await self.library.remove_at(GUILD, "Mix", 1)
+        playlist, added = await self.library.extend(
+            GUILD, "Mix", [SavedTrack("https://y/new", "New", 10)]
+        )
+        self.assertEqual(added, 1)
+        self.assertEqual(playlist.tracks[-1].title, "New")
+
+    async def test_removing_the_last_song_is_fine(self):
+        await self.library.create(GUILD, "Mix")
+        await self.library.extend(GUILD, "Mix", _saved(3))
+        playlist, _ = await self.library.remove_at(GUILD, "Mix", 3)
+        self.assertEqual([t.title for t in playlist.tracks], ["Song 0", "Song 1"])
+
+    async def test_a_database_error_surfaces_as_a_storage_error(self):
+        """The cog reports this; it must not escape as a raw sqlite3 error."""
+        await self.library.create(GUILD, "Mix")
+        self.library.close()  # the database has gone out from under us
+        with self.assertRaises(StorageError):
+            await self.library.summaries(GUILD)
+
+
+class TestPlaylistPersistence(unittest.IsolatedAsyncioTestCase):
+    """A playlist that does not survive a restart is not one."""
+
+    def setUp(self):
+        self.path = _fresh_db()
+
+    async def test_a_library_reopens_with_everything_in_it(self):
+        library = PlaylistLibrary(self.path)
+        await library.create(GUILD, "Late Night", created_by=7)
+        await library.extend(GUILD, "Late Night", _saved(3, seconds=90))
+        library.close()
+
+        reopened = PlaylistLibrary(self.path)
+        self.addCleanup(reopened.close)
+        playlist = await reopened.find(GUILD, "late night")
+        self.assertEqual(playlist.name, "Late Night")
+        self.assertEqual(
+            [t.title for t in playlist.tracks], ["Song 0", "Song 1", "Song 2"]
+        )
+        self.assertEqual(playlist.duration, 270)
+        self.assertEqual(playlist.created_by, 7)
+
+    async def test_opening_creates_the_folder_it_needs(self):
+        library = PlaylistLibrary(self.path)
+        self.addCleanup(library.close)
+        self.assertTrue(self.path.is_file())
+
+    async def test_a_corrupt_database_is_moved_aside_not_overwritten(self):
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self.path.write_bytes(b"this is definitely not a sqlite file" * 10)
+
+        library = PlaylistLibrary(self.path)
+        self.addCleanup(library.close)
+
+        self.assertEqual(await library.summaries(GUILD), [])
+        spoiled = [p for p in self.path.parent.iterdir() if "corrupt" in p.name]
+        self.assertEqual(len(spoiled), 1)
+        self.assertIn(b"not a sqlite file", spoiled[0].read_bytes())
+
+
+class TestImportingTheOldJsonStore(unittest.IsolatedAsyncioTestCase):
+    """The store used to be a JSON file. Nobody should lose it on upgrade."""
+
+    def setUp(self):
+        self.dir = Path(tempfile.mkdtemp(prefix="playlist-test-"))
+        self.db = self.dir / "playlists.db"
+        self.legacy = self.dir / "playlists.json"
+
+    def _write(self, payload):
+        self.legacy.write_text(json.dumps(payload), encoding="utf-8")
+
+    @staticmethod
+    def _entry(name, songs=1, created_by=None):
+        return {
+            "name": name,
+            "created_by": created_by,
+            "tracks": [
+                {"url": f"https://y/{name}{i}", "title": f"{name} {i}", "duration": 60}
+                for i in range(songs)
+            ],
+        }
+
+    def _open(self):
+        library = PlaylistLibrary(self.db)
+        self.addCleanup(library.close)
+        return library
+
+    async def test_a_version_3_file_is_imported(self):
+        self._write({"version": 3, "guilds": {"1": [self._entry("Party", 3, 42)]}})
+        library = self._open()
+        playlist = await library.find(GUILD, "Party")
+        self.assertEqual(len(playlist.tracks), 3)
+        self.assertEqual(playlist.created_by, 42)
+
+    async def test_the_imported_file_is_kept_not_deleted(self):
+        self._write({"version": 3, "guilds": {"1": [self._entry("Party")]}})
+        self._open()
+        self.assertFalse(self.legacy.exists())
+        kept = [p for p in self.dir.iterdir() if "imported" in p.name]
+        self.assertEqual(len(kept), 1)
+        self.assertIn("Party", kept[0].read_text(encoding="utf-8"))
+
+    async def test_a_version_2_file_imports_only_the_server_playlists(self):
+        self._write(
+            {
+                "version": 2,
+                "owners": {
+                    "guild:1": [self._entry("Party")],
+                    "user:42": [self._entry("Private")],
+                },
+            }
+        )
+        library = self._open()
+        self.assertEqual([p.name for p in await library.summaries(GUILD)], ["Party"])
+
+    async def test_a_version_1_file_has_nothing_to_import(self):
+        """Everything in one belonged to a person, not a server."""
+        self._write({"version": 1, "users": {"42": [self._entry("Old")]}})
+        library = self._open()
+        self.assertEqual(await library.summaries(GUILD), [])
+        self.assertFalse(self.legacy.exists())
+
+    async def test_one_malformed_row_costs_that_row_and_nothing_else(self):
+        self._write(
+            {
+                "version": 3,
+                "guilds": {
+                    "1": [
+                        {
+                            "name": "Mix",
+                            "tracks": [
+                                {"url": "https://y/a", "title": "A", "duration": 10},
+                                {"title": "no url"},
+                                "not even an object",
+                                {"url": "https://y/b", "title": "B", "duration": "x"},
+                            ],
+                        }
+                    ]
+                },
+            }
+        )
+        library = self._open()
+        playlist = await library.find(GUILD, "Mix")
+        self.assertEqual([t.title for t in playlist.tracks], ["A", "B"])
+        self.assertEqual(playlist.tracks[1].duration, 0)
+
+    async def test_an_unreadable_file_leaves_the_database_alone(self):
+        self.legacy.write_text("{ not json", encoding="utf-8")
+        library = self._open()
+        self.assertEqual(await library.summaries(GUILD), [])
+        # Left in place rather than renamed: it was not imported, so it is
+        # still the only copy of whatever it holds.
+        self.assertTrue(self.legacy.exists())
+
+    async def test_a_second_startup_does_not_import_twice(self):
+        self._write({"version": 3, "guilds": {"1": [self._entry("Party", 2)]}})
+        first = self._open()
+        self.assertEqual(len(await first.summaries(GUILD)), 1)
+        first.close()
+
+        again = self._open()
+        self.assertEqual(len(await again.summaries(GUILD)), 1)
+
+    async def test_a_json_file_appearing_later_is_not_merged_in(self):
+        """The database is already the source of truth by then."""
+        library = self._open()
+        await library.create(GUILD, "Live One")
+        library.close()
+
+        self._write({"version": 3, "guilds": {"1": [self._entry("Stale")]}})
+        again = self._open()
+        self.assertEqual([p.name for p in await again.summaries(GUILD)], ["Live One"])
+        self.assertTrue(self.legacy.exists())
+
+
+class _PlaylistCogTestCase(unittest.IsolatedAsyncioTestCase):
+    """Shared rig: a cog wired to a temp database and a fake extractor."""
+
+    def setUp(self):
+        from music_player.cogs.player import Player
+        from music_player.cogs.playlists import Playlists
+
+        self.library = PlaylistLibrary(_fresh_db())
+        self.addCleanup(self.library.close)
+        self.youtube = FakeYouTube()
+        self.youtube.fetch = self._fetch
+        self.entries = 3
+        self.unavailable = 0
+
+        self.music = MusicState()
+        self.player = Player(MagicMock(), self.music, self.youtube)
+        self.cog = Playlists(
+            MagicMock(), self.music, self.youtube, self.library, self.player
+        )
+        self.author = FakeUser()
+        self.member = FakeUser(7, "someone-else")
+        self.mod = FakeUser(8, "a-mod", manage_guild=True)
+
+    async def _fetch(self, url):
+        return FetchResult(
+            entries=[
+                TrackInfo(f"https://y/f{i}", f"Fetched {i}", 100)
+                for i in range(self.entries)
+            ],
+            playlist_title="Road Trip" if self.entries > 1 else None,
+            unavailable=self.unavailable,
+        )
+
+    def ctx(self, author=None, guild_id=GUILD):
+        context = FakeContext(FakeChannel())
+        context.author = author or self.author
+        context.guild = FakeGuild(guild_id) if guild_id else None
+        return context
+
+    @staticmethod
+    def last(ctx):
+        return ctx.sent[-1]["embed"]
+
+    async def songs_in(self, name, guild_id=GUILD):
+        playlist = await self.library.find(guild_id, name)
+        return None if playlist is None else len(playlist.tracks)
+
+
+class TestPlaylistCommands(_PlaylistCogTestCase):
+    async def test_create_then_list_shows_it(self):
+        ctx = self.ctx()
+        await self.cog.create.callback(self.cog, ctx, name="Late Night")
+        await self.cog.playlist.callback(self.cog, ctx)
+        self.assertIn("Late Night", self.last(ctx).description)
+
+    async def test_creating_writes_it_immediately(self):
+        await self.cog.create.callback(self.cog, self.ctx(), name="Mix")
+        self.assertIsNotNone(await self.library.find(GUILD, "Mix"))
+
+    async def test_the_creator_is_recorded_for_the_permission_check(self):
+        await self.cog.create.callback(self.cog, self.ctx(), name="Mix")
+        self.assertEqual((await self.library.find(GUILD, "Mix")).created_by, 42)
+
+    async def test_a_database_failure_is_reported_and_changes_nothing(self):
+        ctx = self.ctx()
+        self.library.close()  # the database has gone out from under us
+        await self.cog.create.callback(self.cog, ctx, name="Mix")
+
+        self.assertEqual(len(ctx.sent), 1)
+        self.assertIn("Nothing was changed", self.last(ctx).description)
+
+        # And the claim holds when somebody comes back to look.
+        recovered = PlaylistLibrary(self.library.path)
+        self.addCleanup(recovered.close)
+        self.assertEqual(await recovered.summaries(GUILD), [])
+
+    async def test_an_empty_library_says_how_to_start_one(self):
+        ctx = self.ctx()
+        await self.cog.playlist.callback(self.cog, ctx)
+        self.assertIn("?playlist create", self.last(ctx).description)
+
+    async def test_add_puts_every_fetched_song_in(self):
+        ctx = self.ctx()
+        await self.cog.create.callback(self.cog, ctx, name="Mix")
+        await self.cog.add.callback(self.cog, ctx, "mix", link="https://y/pl")
+        self.assertEqual(await self.songs_in("Mix"), 3)
+        self.assertIn("Added 3 songs", self.last(ctx).author.name)
+
+    async def test_the_confirmation_counts_what_the_playlist_now_holds(self):
+        """It quotes the row the write returned, not the one looked up before."""
+        ctx = self.ctx()
+        await self.cog.create.callback(self.cog, ctx, name="Mix")
+        await self.cog.add.callback(self.cog, ctx, "Mix", link="https://y/pl")
+        await self.cog.add.callback(self.cog, ctx, "Mix", link="https://y/pl")
+        self.assertIn("6 songs", self.last(ctx).footer.text)
+
+    async def test_add_names_a_playlist_that_does_not_exist(self):
+        ctx = self.ctx()
+        await self.cog.add.callback(self.cog, ctx, "ghost", link="https://y/x")
+        self.assertIn("This server doesn't have", self.last(ctx).description)
+
+    async def test_a_bad_link_does_not_touch_the_playlist(self):
+        ctx = self.ctx()
+        await self.cog.create.callback(self.cog, ctx, name="Mix")
+
+        async def boom(url):
+            raise ExtractionError("nope")
+
+        self.youtube.fetch = boom
+        await self.cog.add.callback(self.cog, ctx, "Mix", link="https://y/x")
+        self.assertEqual(await self.songs_in("Mix"), 0)
+        self.assertIn("couldn't read that link", self.last(ctx).description)
+
+    async def test_a_partial_add_says_how_many_did_not_fit(self):
+        ctx = self.ctx()
+        await self.library.create(GUILD, "Mix")
+        await self.library.extend(GUILD, "Mix", _saved(MAX_PLAYLIST_TRACKS - 1))
+        await self.cog.add.callback(self.cog, ctx, "Mix", link="https://y/pl")
+        self.assertIn("2 more didn't fit", self.last(ctx).description)
+
+    async def test_unavailable_videos_are_stated(self):
+        ctx = self.ctx()
+        self.unavailable = 4
+        await self.library.create(GUILD, "Mix")
+        await self.cog.add.callback(self.cog, ctx, "Mix", link="https://y/pl")
+        self.assertIn("Skipped 4 unavailable", self.last(ctx).description)
+
+    async def test_remove_takes_the_numbered_song_out(self):
+        ctx = self.ctx()
+        await self.library.create(GUILD, "Mix")
+        await self.library.extend(GUILD, "Mix", _saved(3))
+        await self.cog.remove.callback(self.cog, ctx, "Mix", 2)
+        playlist = await self.library.find(GUILD, "Mix")
+        self.assertEqual([t.title for t in playlist.tracks], ["Song 0", "Song 2"])
+
+    async def test_a_bad_song_number_states_the_real_range(self):
+        ctx = self.ctx()
+        await self.library.create(GUILD, "Mix")
+        await self.library.extend(GUILD, "Mix", _saved(3))
+        await self.cog.remove.callback(self.cog, ctx, "Mix", 9)
+        self.assertIn("**3**", self.last(ctx).description)
+
+    async def test_rename_reports_both_names(self):
+        ctx = self.ctx()
+        await self.library.create(GUILD, "Old", created_by=42)
+        await self.cog.rename.callback(self.cog, ctx, "Old", new="New")
+        self.assertIn("Old", self.last(ctx).description)
+        self.assertIn("New", self.last(ctx).description)
+
+    async def test_delete_removes_it_for_good(self):
+        ctx = self.ctx()
+        await self.library.create(GUILD, "Mix", created_by=42)
+        await self.cog.delete.callback(self.cog, ctx, name="mix")
+        self.assertEqual(await self.library.summaries(GUILD), [])
+
+    async def test_show_opens_the_browser_on_that_playlist(self):
+        ctx = self.ctx()
+        await self.library.create(GUILD, "Mix")
+        await self.library.extend(GUILD, "Mix", _saved(2))
+        await self.cog.show.callback(self.cog, ctx, name="mix")
+        self.assertEqual(ctx.sent[-1]["view"].selected.name, "Mix")
+        self.assertEqual(self.last(ctx).title, "Mix")
+
+    async def test_autocomplete_offers_this_servers_playlists(self):
+        await self.library.create(GUILD, "Chill Vibes")
+        await self.library.create(GUILD, "Gym")
+        await self.library.create(OTHER_GUILD, "Another Server's")
+        interaction = FakeInteraction(self.author, FakeChannel())
+        choices = await self.cog.playlist_name_autocomplete(interaction, "vib")
+        self.assertEqual([c.value for c in choices], ["Chill Vibes"])
+
+    async def test_autocomplete_with_nothing_typed_offers_everything(self):
+        await self.library.create(GUILD, "One")
+        await self.library.create(GUILD, "Two")
+        interaction = FakeInteraction(self.author, FakeChannel())
+        choices = await self.cog.playlist_name_autocomplete(interaction, "")
+        self.assertEqual([c.value for c in choices], ["One", "Two"])
+
+    async def test_autocomplete_in_a_dm_offers_nothing(self):
+        interaction = FakeInteraction(self.author, FakeChannel(), guild_id=None)
+        self.assertEqual(
+            await self.cog.playlist_name_autocomplete(interaction, ""), []
+        )
+
+    async def test_autocomplete_stays_quiet_when_the_database_fails(self):
+        """There is no way to show an error in an autocomplete dropdown."""
+        interaction = FakeInteraction(self.author, FakeChannel())
+        self.library.close()
+        self.assertEqual(
+            await self.cog.playlist_name_autocomplete(interaction, ""), []
+        )
+
+
+class TestPlaylistsAreTheServers(_PlaylistCogTestCase):
+    """A playlist made in server A is reachable only from server A."""
+
+    async def test_another_server_cannot_see_it(self):
+        await self.cog.create.callback(self.cog, self.ctx(), name="Ours")
+        elsewhere = self.ctx(guild_id=OTHER_GUILD)
+        await self.cog.playlist.callback(self.cog, elsewhere)
+        self.assertIn("hasn't saved any playlists", self.last(elsewhere).description)
+
+    async def test_another_server_cannot_play_it(self):
+        await self.library.create(GUILD, "Ours", created_by=42)
+        await self.library.extend(GUILD, "Ours", _saved(3))
+        elsewhere = self.ctx(guild_id=OTHER_GUILD)
+        await self.cog.play.callback(self.cog, elsewhere, name="Ours")
+        self.assertEqual(self.music.get(OTHER_GUILD).queue, [])
+        self.assertIn("This server doesn't have", self.last(elsewhere).description)
+
+    async def test_another_server_cannot_delete_it(self):
+        await self.library.create(GUILD, "Ours", created_by=42)
+        elsewhere = self.ctx(guild_id=OTHER_GUILD)
+        await self.cog.delete.callback(self.cog, elsewhere, name="Ours")
+        self.assertIsNotNone(await self.library.find(GUILD, "Ours"))
+
+    async def test_everyone_in_the_server_sees_the_same_list(self):
+        await self.cog.create.callback(self.cog, self.ctx(), name="Party Mix")
+        ctx = self.ctx(self.member)
+        await self.cog.playlist.callback(self.cog, ctx)
+        self.assertIn("Party Mix", self.last(ctx).description)
+
+    async def test_the_overview_is_headed_by_the_server(self):
+        await self.cog.create.callback(self.cog, self.ctx(), name="Party Mix")
+        ctx = self.ctx()
+        await self.cog.playlist.callback(self.cog, ctx)
+        self.assertEqual(self.last(ctx).author.name, "Test Server")
+
+    async def test_someone_else_can_add_songs(self):
+        await self.cog.create.callback(self.cog, self.ctx(), name="Party Mix")
+        ctx = self.ctx(self.member)
+        await self.cog.add.callback(self.cog, ctx, "party mix", link="https://y/pl")
+        self.assertEqual(await self.songs_in("Party Mix"), 3)
+
+    async def test_someone_else_can_remove_songs(self):
+        await self.library.create(GUILD, "Party Mix", created_by=42)
+        await self.library.extend(GUILD, "Party Mix", _saved(3))
+        await self.cog.remove.callback(self.cog, self.ctx(self.member), "Party Mix", 1)
+        self.assertEqual(await self.songs_in("Party Mix"), 2)
+
+    async def test_someone_else_cannot_delete_it(self):
+        await self.library.create(GUILD, "Party Mix", created_by=42)
+        ctx = self.ctx(self.member)
+        await self.cog.delete.callback(self.cog, ctx, name="Party Mix")
+        self.assertIsNotNone(await self.library.find(GUILD, "Party Mix"))
+        self.assertIn("isn't yours", self.last(ctx).description)
+
+    async def test_the_refusal_says_what_they_can_still_do(self):
+        """Otherwise it reads as though the playlists are not shared at all."""
+        await self.library.create(GUILD, "Party Mix", created_by=42)
+        ctx = self.ctx(self.member)
+        await self.cog.delete.callback(self.cog, ctx, name="Party Mix")
+        self.assertIn("?playlist add", self.last(ctx).description)
+
+    async def test_someone_else_cannot_rename_it(self):
+        await self.library.create(GUILD, "Party Mix", created_by=42)
+        await self.cog.rename.callback(
+            self.cog, self.ctx(self.member), "Party Mix", new="Mine Now"
+        )
+        self.assertIsNotNone(await self.library.find(GUILD, "Party Mix"))
+
+    async def test_the_creator_can_delete_it(self):
+        await self.library.create(GUILD, "Party Mix", created_by=42)
+        await self.cog.delete.callback(self.cog, self.ctx(), name="Party Mix")
+        self.assertIsNone(await self.library.find(GUILD, "Party Mix"))
+
+    async def test_a_moderator_can_delete_someone_elses(self):
+        await self.library.create(GUILD, "Party Mix", created_by=42)
+        await self.cog.delete.callback(self.cog, self.ctx(self.mod), name="Party Mix")
+        self.assertIsNone(await self.library.find(GUILD, "Party Mix"))
+
+    async def test_a_moderator_can_rename_someone_elses(self):
+        await self.library.create(GUILD, "Party Mix", created_by=42)
+        await self.cog.rename.callback(
+            self.cog, self.ctx(self.mod), "Party Mix", new="House Rules"
+        )
+        self.assertIsNotNone(await self.library.find(GUILD, "House Rules"))
+
+    async def test_a_playlist_with_no_recorded_creator_is_moderators_only(self):
+        """A hand-edited row, or one imported from an older store."""
+        await self.library.create(GUILD, "Legacy")
+        await self.cog.delete.callback(self.cog, self.ctx(), name="Legacy")
+        self.assertIsNotNone(await self.library.find(GUILD, "Legacy"))
+
+        await self.cog.delete.callback(self.cog, self.ctx(self.mod), name="Legacy")
+        self.assertIsNone(await self.library.find(GUILD, "Legacy"))
+
+    async def test_a_dm_is_refused_by_the_cog_check(self):
+        ctx = self.ctx(guild_id=None)
+        with self.assertRaises(commands.NoPrivateMessage):
+            await self.cog.cog_check(ctx)
+
+    async def test_the_dm_refusal_explains_why(self):
+        ctx = self.ctx()
+        ctx.command = self.cog.create
+        await self.cog.cog_command_error(ctx, commands.NoPrivateMessage())
+        self.assertIn("live in a server", self.last(ctx).description)
+
+
+class TestPlaylistIntoTheQueue(_PlaylistCogTestCase):
+    """Loading a playlist is a copy into the guild queue, not a link to it."""
+
+    async def asyncSetUp(self):
+        await self.library.create(GUILD, "Mix", created_by=42)
+        await self.library.extend(GUILD, "Mix", _saved(3))
+        self.state = self.music.get(GUILD)
+
+    async def test_queue_appends_and_leaves_what_was_waiting(self):
+        self.state.queue.append(Track("https://y/old", "Old", 60, 1, "u"))
+        ctx = self.ctx()
+        await self.cog.enqueue.callback(self.cog, ctx, name="Mix")
+        self.assertEqual(
+            [t.title for t in self.state.queue],
+            ["Old", "Song 0", "Song 1", "Song 2"],
+        )
+        self.assertIn("#2 in queue", self.last(ctx).footer.text)
+
+    async def test_play_replaces_an_idle_queue(self):
+        self.state.queue.append(Track("https://y/old", "Old", 60, 1, "u"))
+        await self.cog.play.callback(self.cog, self.ctx(), name="Mix")
+        self.assertEqual(
+            [t.title for t in self.state.queue], ["Song 0", "Song 1", "Song 2"]
+        )
+
+    async def test_play_says_the_queue_was_replaced(self):
+        ctx = self.ctx()
+        await self.cog.play.callback(self.cog, ctx, name="Mix")
+        self.assertIn("queue was replaced", self.last(ctx).footer.text)
+
+    async def test_play_without_a_voice_connection_says_how_to_get_one(self):
+        ctx = self.ctx()
+        await self.cog.play.callback(self.cog, ctx, name="Mix")
+        self.assertIn("/join", self.last(ctx).description)
+
+    async def test_play_over_a_live_track_jumps_into_the_playlist(self):
+        """The song on air is skipped past, not left at the head of the queue."""
+        self.state.voice = FakeVoice()
+        self.state.voice.playing = True
+        self.state.mark_started()
+        self.state.queue.extend(
+            [
+                Track("https://y/live", "Live", 300, 1, "u"),
+                Track("https://y/waiting", "Waiting", 90, 1, "u"),
+            ]
+        )
+        await self.cog.play.callback(self.cog, self.ctx(), name="Mix")
+        self.assertEqual(
+            [t.title for t in self.state.queue], ["Song 0", "Song 1", "Song 2"]
+        )
+
+    async def test_the_loaded_tracks_credit_whoever_asked(self):
+        await self.cog.play.callback(self.cog, self.ctx(self.member), name="Mix")
+        self.assertTrue(all(t.requester_id == 7 for t in self.state.queue))
+
+    async def test_editing_the_queue_does_not_edit_the_playlist(self):
+        await self.cog.play.callback(self.cog, self.ctx(), name="Mix")
+        self.state.queue.clear()
+        self.assertEqual(await self.songs_in("Mix"), 3)
+
+    async def test_an_empty_playlist_is_not_loaded(self):
+        ctx = self.ctx()
+        await self.library.create(GUILD, "Empty")
+        await self.cog.play.callback(self.cog, ctx, name="Empty")
+        self.assertEqual(self.state.queue, [])
+        self.assertIn("is empty", self.last(ctx).description)
+
+    async def test_each_server_gets_its_own_queue(self):
+        await self.library.create(OTHER_GUILD, "Theirs", created_by=1)
+        await self.library.extend(OTHER_GUILD, "Theirs", _saved(2))
+        await self.cog.play.callback(self.cog, self.ctx(), name="Mix")
+        await self.cog.play.callback(
+            self.cog, self.ctx(guild_id=OTHER_GUILD), name="Theirs"
+        )
+        self.assertEqual(len(self.music.get(GUILD).queue), 3)
+        self.assertEqual(len(self.music.get(OTHER_GUILD).queue), 2)
+
+    async def _drain(self):
+        """Empty the queue the way the voice after-callback does.
+
+        ``_on_track_end`` schedules one ``_advance`` per finished track; the
+        last one clears the queue. Calling it directly exercises that same
+        path without needing real audio.
+        """
+        channel = FakeChannel()
+        while self.state.queue:
+            await self.player._advance(
+                channel, self.state, forced=False, expect=self.state.current
+            )
+        self.state.cancel_idle_disconnect()
+
+    async def test_playing_a_playlist_to_the_end_does_not_touch_it(self):
+        """The queue empties itself when the last song finishes.
+
+        The playlist it was loaded from has to be exactly as it was. Loading is
+        a copy, so nothing in the playback path can reach the stored songs, and
+        this is the test that says so.
+        """
+        await self.cog.play.callback(self.cog, self.ctx(), name="Mix")
+        self.assertEqual(len(self.state.queue), 3)
+
+        await self._drain()
+
+        self.assertEqual(self.state.queue, [])
+        self.assertEqual(await self.songs_in("Mix"), 3)
+
+    async def test_the_playlist_can_be_played_again_afterwards(self):
+        """The real proof that nothing was consumed: do it twice."""
+        await self.cog.play.callback(self.cog, self.ctx(), name="Mix")
+        await self._drain()
+
+        await self.cog.play.callback(self.cog, self.ctx(), name="Mix")
+        self.assertEqual(
+            [t.title for t in self.state.queue], ["Song 0", "Song 1", "Song 2"]
+        )
+
+    async def test_stop_clears_the_queue_and_leaves_the_playlist(self):
+        await self.cog.play.callback(self.cog, self.ctx(), name="Mix")
+        await self.player.stop.callback(self.player, self.ctx())
+        self.assertEqual(self.state.queue, [])
+        self.assertEqual(await self.songs_in("Mix"), 3)
+
+    async def test_clear_leaves_the_playlist(self):
+        await self.cog.play.callback(self.cog, self.ctx(), name="Mix")
+        await self.player.clear.callback(self.player, self.ctx())
+        self.assertEqual(self.state.queue, [])
+        self.assertEqual(await self.songs_in("Mix"), 3)
+
+    async def test_skipping_through_every_song_leaves_the_playlist(self):
+        await self.cog.play.callback(self.cog, self.ctx(), name="Mix")
+        channel = FakeChannel()
+        for _ in range(3):
+            await self.player.perform_skip(channel, self.state)
+        self.state.cancel_idle_disconnect()
+        self.assertEqual(await self.songs_in("Mix"), 3)
+
+
+
+class TestWhereTheSongCameFrom(_PlaylistCogTestCase):
+    """A queued song remembers the playlist it arrived with, and says so."""
+
+    async def asyncSetUp(self):
+        await self.library.create(GUILD, "Late Night", created_by=42)
+        await self.library.extend(GUILD, "Late Night", _saved(3))
+        self.state = self.music.get(GUILD)
+
+    async def test_loading_a_playlist_stamps_every_song(self):
+        await self.cog.play.callback(self.cog, self.ctx(), name="Late Night")
+        self.assertTrue(all(t.source == "Late Night" for t in self.state.queue))
+
+    async def test_the_name_is_snapshotted_not_looked_up(self):
+        """Renaming the playlist must not rewrite history in the queue."""
+        await self.cog.play.callback(self.cog, self.ctx(), name="Late Night")
+        await self.library.rename(GUILD, "Late Night", "Something Else")
+        self.assertEqual(self.state.queue[0].source, "Late Night")
+
+    async def test_a_song_added_on_its_own_has_no_source(self):
+        self.entries = 1
+        ctx = self.ctx()
+        await self.player.add.callback(self.player, ctx, url="https://y/one")
+        self.assertIsNone(self.state.queue[-1].source)
+
+    async def test_a_youtube_playlist_link_names_itself(self):
+        """?add of a playlist link is the other way a song arrives in a group."""
+        ctx = self.ctx()
+        await self.player.add.callback(self.player, ctx, url="https://y/pl")
+        self.assertTrue(all(t.source == "Road Trip" for t in self.state.queue))
+
+    async def test_now_playing_shows_where_it_came_from(self):
+        await self.cog.play.callback(self.cog, self.ctx(), name="Late Night")
+        # Nothing is actually on air without a voice client, so build the
+        # snapshot the same way _play_current would.
+        snapshot = ui.NowPlaying(
+            title="x", url="y", duration=10, thumbnail=None, requester=None,
+            volume=0.1, position=1, total=3, up_next=None, remaining=30,
+            source=self.state.queue[0].source,
+        )
+        rendered = ui.now_playing(snapshot)
+        field = next(f for f in rendered.fields if f.name == "From")
+        self.assertIn("Late Night", field.value)
+
+    async def test_the_from_field_is_absent_without_a_source(self):
+        rendered = ui.now_playing(
+            ui.NowPlaying(
+                title="x", url="y", duration=10, thumbnail=None, requester=None,
+                volume=0.1, position=1, total=1, up_next=None, remaining=10,
+            )
+        )
+        self.assertNotIn("From", [f.name for f in rendered.fields])
+
+    async def test_the_queue_names_it_on_the_live_track(self):
+        await self.cog.play.callback(self.cog, self.ctx(), name="Late Night")
+        rendered = ui.queue_page(self.state.queue, 1, status=ui.PLAYING_MARKER)
+        self.assertIn("from **Late Night**", rendered.description)
+
+    async def test_the_listing_marks_the_playlist_that_is_on_air(self):
+        await self.cog.play.callback(self.cog, self.ctx(), name="Late Night")
+        await self.library.create(GUILD, "Gym", created_by=42)
+
+        ctx = self.ctx()
+        await self.cog.playlist.callback(self.cog, ctx)
+        rows = self.last(ctx).description.splitlines()
+
+        self.assertIn(ui.PLAYING_MARKER, rows[0])
+        self.assertNotIn(ui.PLAYING_MARKER, rows[1])
+
+    async def test_the_listing_marks_nothing_when_nothing_plays(self):
+        ctx = self.ctx()
+        await self.cog.playlist.callback(self.cog, ctx)
+        self.assertNotIn(ui.PLAYING_MARKER, self.last(ctx).description)
+
+    async def test_the_listing_credits_whoever_made_each_one(self):
+        ctx = self.ctx()
+        await self.cog.playlist.callback(self.cog, ctx)
+        self.assertIn("<@42>", self.last(ctx).description)
+
+    async def test_the_marker_follows_a_rename_of_the_live_playlist(self):
+        """The queue keeps the old name, so the renamed row is not marked."""
+        await self.cog.play.callback(self.cog, self.ctx(), name="Late Night")
+        await self.library.rename(GUILD, "Late Night", "Something Else")
+
+        ctx = self.ctx()
+        await self.cog.playlist.callback(self.cog, ctx)
+        self.assertNotIn(ui.PLAYING_MARKER, self.last(ctx).description)
+
+    async def test_the_playlist_page_marks_the_song_on_air(self):
+        await self.cog.play.callback(self.cog, self.ctx(), name="Late Night")
+        playlist = await self.library.require(GUILD, "Late Night")
+        rendered = ui.playlist_page(
+            playlist, 1, playing_url=self.state.queue[0].url
+        )
+        rows = rendered.description.splitlines()
+        self.assertTrue(rows[0].endswith(ui.PLAYING_MARKER))
+        self.assertFalse(rows[1].endswith(ui.PLAYING_MARKER))
+
+    async def test_the_page_marks_nothing_when_nothing_matches(self):
+        playlist = await self.library.require(GUILD, "Late Night")
+        rendered = ui.playlist_page(playlist, 1, playing_url="https://y/elsewhere")
+        self.assertNotIn(ui.PLAYING_MARKER, rendered.description)
+
+class TestPlaylistBrowserView(_PlaylistCogTestCase):
+    async def asyncSetUp(self):
+        from music_player.ui.views import PlaylistBrowser
+
+        await self.library.create(GUILD, "Chill", created_by=42)
+        await self.library.extend(GUILD, "Chill", _saved(14))
+        await self.library.create(GUILD, "Empty", created_by=42)
+        self.channel = FakeChannel()
+        self.view = PlaylistBrowser(
+            self.cog, self.author, FakeGuild(), await self.library.summaries(GUILD)
+        )
+
+    def _select(self, index: int):
+        self.view.choose._values = [str(index)]
+
+    async def test_the_dropdown_lists_every_playlist(self):
+        self.assertEqual(
+            [option.label for option in self.view.choose.options], ["Chill", "Empty"]
+        )
+
+    async def test_the_menu_holds_no_songs_until_one_is_picked(self):
+        """The listing reads a GROUP BY, not every track in the server.
+
+        Opening the menu on a full server used to materialise a quarter of a
+        million rows to print two numbers per line.
+        """
+        self.assertEqual([s.songs for s in self.view.summaries], [14, 0])
+        self.assertFalse(any(hasattr(s, "tracks") for s in self.view.summaries))
+        self.assertIsNone(self.view.selected)
+
+    async def test_picking_one_reads_its_songs(self):
+        self._select(0)
+        await self.view._on_choose(FakeInteraction(self.author, self.channel))
+        self.assertEqual(len(self.view.selected.tracks), 14)
+
+    async def test_picking_one_that_was_just_deleted_says_so(self):
+        """The menu outlives the query it was built from."""
+        await self.library.delete(GUILD, "Chill")
+
+        interaction = FakeInteraction(self.author, self.channel)
+        self._select(0)
+        await self.view._on_choose(interaction)
+
+        self.assertIsNone(self.view.selected)
+        self.assertEqual(interaction.response.edits, [])
+        self.assertIn(
+            "doesn't have a playlist",
+            interaction.response.messages[0]["embed"].description,
+        )
+
+    async def test_the_landing_page_is_headed_by_the_server(self):
+        self.assertEqual(self.view.render().author.name, "Test Server")
+
+    async def test_nothing_is_playable_until_something_is_picked(self):
+        self.assertTrue(self.view.play.disabled)
+        self.assertTrue(self.view.enqueue.disabled)
+
+    async def test_picking_one_opens_it(self):
+        interaction = FakeInteraction(self.author, self.channel)
+        self._select(0)
+        await self.view._on_choose(interaction)
+        embed = interaction.response.edits[0]["embed"]
+        self.assertEqual(embed.title, "Chill")
+        self.assertIn("Page 1/2", embed.footer.text)
+        self.assertFalse(self.view.play.disabled)
+
+    async def test_an_empty_playlist_cannot_be_played(self):
+        self._select(1)
+        await self.view._on_choose(FakeInteraction(self.author, self.channel))
+        self.assertTrue(self.view.play.disabled)
+
+    async def test_paging_stops_at_both_ends(self):
+        self._select(0)
+        await self.view._on_choose(FakeInteraction(self.author, self.channel))
+        self.assertTrue(self.view.previous.disabled)
+
+        await self.view.next.callback(FakeInteraction(self.author, self.channel))
+        self.assertEqual(self.view.indicator.label, "2 / 2")
+        self.assertTrue(self.view.next.disabled)
+        self.assertFalse(self.view.previous.disabled)
+
+    async def test_the_page_number_is_pressable_once_there_are_pages(self):
+        """It used to be a dead read-out; 1,000 pages of arrows is not a UI."""
+        self.assertTrue(self.view.indicator.disabled)  # nothing picked yet
+
+        self._select(0)
+        await self.view._on_choose(FakeInteraction(self.author, self.channel))
+        self.assertFalse(self.view.indicator.disabled)
+        self.assertEqual(self.view.indicator.label, "1 / 2")
+
+    async def test_a_single_page_has_nowhere_to_jump_to(self):
+        self._select(1)  # the empty playlist
+        await self.view._on_choose(FakeInteraction(self.author, self.channel))
+        self.assertTrue(self.view.indicator.disabled)
+
+    async def test_jumping_moves_the_page(self):
+        from music_player.ui.views import JumpToPage
+
+        self._select(0)
+        await self.view._on_choose(FakeInteraction(self.author, self.channel))
+
+        modal = JumpToPage(self.view, 2)
+        modal._number._value = "2"
+        interaction = FakeInteraction(self.author, self.channel)
+        await modal.on_submit(interaction)
+
+        self.assertEqual(self.view.page, 2)
+        self.assertIn("Page 2/2", interaction.response.edits[0]["embed"].footer.text)
+
+    async def test_a_page_that_is_not_there_is_refused(self):
+        from music_player.ui.views import JumpToPage
+
+        self._select(0)
+        await self.view._on_choose(FakeInteraction(self.author, self.channel))
+
+        modal = JumpToPage(self.view, 2)
+        modal._number._value = "99"
+        interaction = FakeInteraction(self.author, self.channel)
+        await modal.on_submit(interaction)
+
+        self.assertEqual(self.view.page, 1)
+        self.assertIn(
+            "no page 99", interaction.response.messages[0]["embed"].description
+        )
+
+    async def test_something_that_is_not_a_number_is_refused(self):
+        from music_player.ui.views import JumpToPage
+
+        self._select(0)
+        await self.view._on_choose(FakeInteraction(self.author, self.channel))
+
+        modal = JumpToPage(self.view, 2)
+        modal._number._value = "last one"
+        interaction = FakeInteraction(self.author, self.channel)
+        await modal.on_submit(interaction)
+
+        self.assertEqual(self.view.page, 1)
+        self.assertIn(
+            "isn't a page number",
+            interaction.response.messages[0]["embed"].description,
+        )
+
+    async def test_the_input_is_sized_to_the_page_count(self):
+        """A four-digit playlist needs four digits of room."""
+        from music_player.ui.views import JumpToPage
+
+        self.assertEqual(JumpToPage(self.view, 1000)._number.max_length, 4)
+
+    async def test_the_play_button_fills_the_queue(self):
+        self._select(0)
+        await self.view._on_choose(FakeInteraction(self.author, self.channel))
+        interaction = FakeInteraction(self.author, self.channel)
+        await self.view.play.callback(interaction)
+
+        self.assertTrue(interaction.response.deferred)
+        self.assertEqual(len(self.music.get(GUILD).queue), 14)
+        posted = self.channel.sent[-1]["embed"]
+        self.assertIn("Playing", posted.author.name)
+        self.assertEqual(posted.title, "Chill")
+
+    async def test_the_queue_button_appends_instead(self):
+        self._select(0)
+        await self.view._on_choose(FakeInteraction(self.author, self.channel))
+        self.music.get(GUILD).queue.append(Track("https://y/old", "Old", 60, 1, "u"))
+        await self.view.enqueue.callback(FakeInteraction(self.author, self.channel))
+        self.assertEqual(self.music.get(GUILD).queue[0].title, "Old")
+        self.assertEqual(len(self.music.get(GUILD).queue), 15)
+
+    async def test_a_playlist_deleted_under_an_open_view_is_not_played(self):
+        """The view outlives the command, and anyone here can delete."""
+        self._select(0)
+        await self.view._on_choose(FakeInteraction(self.author, self.channel))
+        await self.library.delete(GUILD, "Chill")
+
+        interaction = FakeInteraction(self.author, self.channel)
+        await self.view.play.callback(interaction)
+
+        self.assertEqual(self.music.get(GUILD).queue, [])
+        self.assertIn(
+            "doesn't have a playlist",
+            interaction.response.messages[0]["embed"].description,
+        )
+
+    async def test_someone_elses_view_cannot_be_driven(self):
+        """The playlists are shared; this particular message is not."""
+        stranger = FakeInteraction(self.member, self.channel)
+        self.assertFalse(await self.view.interaction_check(stranger))
+        self.assertIn(
+            "belongs to someone else",
+            stranger.response.messages[0]["embed"].description,
+        )
+
+    async def test_the_owner_can_drive_it(self):
+        mine = FakeInteraction(self.author, self.channel)
+        self.assertTrue(await self.view.interaction_check(mine))
+
+
+class TestPlaylistEmbeds(unittest.TestCase):
+    """Playlist names come from users, and every dead end names its way out."""
+
+    def test_a_name_cannot_break_the_layout_it_is_shown_in(self):
+        rendered = ui.no_such_playlist("line one\nline two")
+        self.assertNotIn("line one\nline two", rendered.description)
+        self.assertIn("line one line two", rendered.description)
+
+    def test_a_very_long_name_is_clipped(self):
+        rendered = ui.no_such_playlist("x" * 400)
+        self.assertLess(len(rendered.description), 200)
+
+    def test_dead_ends_name_the_command_that_fixes_them(self):
+        self.assertIn("?playlist create", ui.no_playlists().description)
+        self.assertIn("?playlist", ui.no_such_playlist("x").description)
+        self.assertIn("?playlist delete", ui.too_many_playlists(25).description)
+        self.assertIn("?playlist remove", ui.playlist_full("x", 500).description)
+        self.assertIn("?playlist add", ui.playlist_is_empty(Playlist("x")).description)
+        self.assertIn(
+            "?playlist show", ui.no_such_playlist_song("x", 9, 3).description
+        )
+
+    def test_every_message_speaks_of_the_server_not_the_person(self):
+        for rendered in (ui.no_playlists(), ui.no_such_playlist("x")):
+            self.assertIn("server", rendered.description.lower())
+            self.assertNotIn("You don't have", rendered.description)
+
+    def test_the_storage_failure_says_nothing_changed(self):
+        """A rolled-back transaction leaves nothing half-applied to explain."""
+        self.assertIn("Nothing was changed", ui.playlist_not_saved().description)
+
+    def test_an_empty_playlist_is_told_apart_from_a_bad_number(self):
+        self.assertIn("is empty", ui.no_such_playlist_song("x", 1, 0).description)
+
+    def test_the_refusal_credits_whoever_started_the_playlist(self):
+        rendered = ui.not_your_playlist(Playlist("Mix", created_by=77))
+        self.assertIn("<@77>", rendered.description)
+
+    def test_the_refusal_copes_with_no_recorded_creator(self):
+        rendered = ui.not_your_playlist(Playlist("Mix"))
+        self.assertIn("no recorded creator", rendered.description)
+        self.assertIn("Manage Server", rendered.description)
+
+    def test_big_counts_are_readable(self):
+        """The cap is five digits now, so they carry separators."""
+        playlist = Playlist("Mix", tracks=_saved(10_000))
+        self.assertIn("10,000 songs", ui.playlist_page(playlist, 1).footer.text)
+        self.assertIn("10,000 songs", ui.playlist_full("Mix", 10_000).description)
+
+    def test_the_overview_counts_songs_and_time(self):
+        playlist = Playlist("Mix", tracks=_saved(3, seconds=120))
+        rendered = ui.playlist_overview([playlist], title="Playlists")
+        self.assertIn("3 songs", rendered.description)
+        self.assertIn("6 min", rendered.description)
+
+    def test_an_empty_playlist_reads_as_empty_rather_than_zero(self):
+        rendered = ui.playlist_overview([Playlist("Mix")], title="Playlists")
+        self.assertIn("empty", rendered.description)
+
+    def test_a_page_numbers_rows_the_way_remove_counts(self):
+        playlist = Playlist("Mix", tracks=_saved(14))
+        rendered = ui.playlist_page(playlist, 2)
+        self.assertTrue(rendered.description.startswith("`11.`"))
+        self.assertIn("Page 2/2", rendered.footer.text)
+
+    def test_a_page_past_the_end_lands_on_the_last_one(self):
+        playlist = Playlist("Mix", tracks=_saved(3))
+        self.assertIn("Page 1/1", ui.playlist_page(playlist, 99).footer.text)
+
+    def test_every_row_links_its_song(self):
+        playlist = Playlist("Mix", tracks=_saved(3))
+        for track in playlist.tracks:
+            self.assertIn(f"(<{track.url}>)", ui.playlist_page(playlist, 1).description)
+
+    def test_the_queue_confirmation_names_the_first_two_songs(self):
+        """"40 songs" without saying which one starts leaves the obvious
+        question unanswered."""
+        playlist = Playlist("Late Night", tracks=_saved(3))
+        rendered = ui.playlist_queued(playlist, 3, position=5, starts_in=740)
+
+        self.assertEqual(rendered.title, "Late Night")
+        self.assertEqual(
+            [f.name for f in rendered.fields], ["First up", "Then"]
+        )
+        self.assertIn("Song 0", rendered.fields[0].value)
+        self.assertIn("Song 1", rendered.fields[1].value)
+
+    def test_the_play_confirmation_names_what_starts_and_what_follows(self):
+        playlist = Playlist("Late Night", tracks=_saved(3))
+        rendered = ui.playlist_playing(playlist, 3)
+        self.assertEqual(
+            [f.name for f in rendered.fields], ["Starting with", "Up next"]
+        )
+
+    def test_a_one_song_playlist_has_nothing_to_follow_with(self):
+        playlist = Playlist("Solo", tracks=_saved(1))
+        self.assertEqual(
+            [f.name for f in ui.playlist_queued(playlist, 1).fields], ["First up"]
+        )
+        self.assertEqual(
+            [f.name for f in ui.playlist_playing(playlist, 1).fields],
+            ["Starting with"],
+        )
+
+    def test_both_confirmations_carry_the_cover_of_the_first_song(self):
+        playlist = Playlist(
+            "Late Night",
+            tracks=[SavedTrack("https://youtu.be/dQw4w9WgXcQ", "A", 213)],
+        )
+        for rendered in (
+            ui.playlist_queued(playlist, 1),
+            ui.playlist_playing(playlist, 1),
+        ):
+            self.assertIn("dQw4w9WgXcQ", rendered.thumbnail.url)
+
+    def test_a_playlist_of_non_youtube_links_still_renders(self):
+        """artwork() returns None for anything it cannot key on."""
+        playlist = Playlist("Odd", tracks=[SavedTrack("https://example/x", "A", 60)])
+        rendered = ui.playlist_queued(playlist, 1)
+        self.assertIsNone(rendered.thumbnail.url)
+        self.assertEqual([f.name for f in rendered.fields], ["First up"])
+
+    def test_the_play_confirmation_offers_the_non_destructive_command(self):
+        playlist = Playlist("Mix", tracks=_saved(3))
+        rendered = ui.playlist_playing(playlist, 3)
+        self.assertIn("?playlist queue", rendered.footer.text)
+
+    def test_creating_one_says_who_may_later_delete_it(self):
+        rendered = ui.playlist_created(Playlist("Mix"))
+        self.assertIn("Anyone in this server can add", rendered.description)
+        self.assertIn("moderator", rendered.description)
+
+
+class TestReachingDiscordCanFail(unittest.IsolatedAsyncioTestCase):
+    """Not reaching Discord is not the same as Discord saying no.
+
+    ``discord.HTTPException`` is Discord *answering* with an error. A TLS
+    handshake it refuses, a dropped connection, a socket timeout - those
+    arrive as aiohttp or socket errors, and a guard naming only the first
+    lets them straight through the try that was meant to contain them.
+    """
+
+    @staticmethod
+    def _ssl_failure():
+        """The exact exception a refused TLS handshake to Discord raises."""
+        import aiohttp
+
+        return aiohttp.ClientConnectorSSLError(
+            MagicMock(ssl=True, host="discord.com", port=443, is_ssl=True),
+            OSError("[SSL: SSLV3_ALERT_HANDSHAKE_FAILURE] handshake failure"),
+        )
+
+    def test_the_failure_is_not_an_http_exception(self):
+        """The premise: this is why the old guard missed it."""
+        self.assertNotIsInstance(self._ssl_failure(), discord.HTTPException)
+
+    def test_but_it_is_covered_now(self):
+        from music_player.errors import DELIVERY_FAILED
+
+        self.assertIsInstance(self._ssl_failure(), DELIVERY_FAILED)
+
+    def test_every_shape_of_delivery_failure_is_covered(self):
+        import aiohttp
+        from music_player.errors import DELIVERY_FAILED
+
+        cases = [
+            self._ssl_failure(),
+            aiohttp.ServerDisconnectedError(),          # not an OSError
+            aiohttp.ClientPayloadError(),               # nor this
+            TimeoutError(),                             # not an aiohttp error
+            OSError("connection reset"),
+            discord.HTTPException(MagicMock(status=500, reason="x"), "boom"),
+        ]
+        for exc in cases:
+            self.assertIsInstance(exc, DELIVERY_FAILED, type(exc).__name__)
+
+    async def test_a_lost_connection_does_not_stop_the_music(self):
+        """The song is already playing by the time the announcement is sent."""
+        from music_player.cogs.player import Player
+
+        player = Player(MagicMock(), MusicState(), FakeYouTube())
+        player.ffmpeg_path = "ffmpeg"
+
+        state = player.state.get(1)
+        state.voice = FakeVoice()
+        state.queue.append(Track("https://youtu.be/dQw4w9WgXcQ", "A Song", 213, 1, "u"))
+
+        channel = MagicMock()
+        channel.send = AsyncMock(side_effect=self._ssl_failure())
+        channel.guild = None
+
+        source = MagicMock()
+        source.wait_until_ready = AsyncMock()
+
+        with patch.object(discord, "FFmpegPCMAudio", lambda *a, **k: MagicMock()),              patch("music_player.cogs.player.BufferedAudioSource",
+                   lambda *a, **k: source),              patch.object(discord, "PCMVolumeTransformer", lambda s, volume=1.0: s):
+            # Must not raise: the audio is already going.
+            await player.start_queue(channel, state)
+
+        self.addCleanup(state.cancel_idle_disconnect)
+        self.assertTrue(state.voice.playing, "the song stopped over a failed message")
+
+
+class TestErrorsStillReachTheUser(unittest.IsolatedAsyncioTestCase):
+    """A dead interaction must not turn a failure into silence.
+
+    Discord expects a slash command acknowledged within three seconds and
+    answers ``10062 Unknown interaction`` after that. A gateway outage is
+    exactly when it happens: events arrive late and the token is already
+    stale, so the reply 404s. The channel is still there.
+    """
+
+    def _ctx(self, *, slash: bool, send_fails: bool):
+        import app
+
+        ctx = MagicMock()
+        ctx.interaction = MagicMock() if slash else None
+        ctx.send = AsyncMock()
+        if send_fails:
+            response = MagicMock(status=404, reason="Not Found")
+            ctx.send.side_effect = discord.NotFound(response, "Unknown interaction")
+        ctx.channel = MagicMock()
+        ctx.channel.send = AsyncMock()
+        return app.bot, ctx
+
+    async def test_the_normal_path_replies_once(self):
+        bot, ctx = self._ctx(slash=True, send_fails=False)
+        await bot._report_failure(ctx)
+        ctx.send.assert_awaited_once()
+        ctx.channel.send.assert_not_awaited()
+
+    async def test_a_dead_interaction_falls_back_to_the_channel(self):
+        bot, ctx = self._ctx(slash=True, send_fails=True)
+        await bot._report_failure(ctx)
+        ctx.channel.send.assert_awaited_once()
+
+    async def test_a_prefix_command_does_not_retry_the_same_route(self):
+        """ctx.send already *was* the channel; a second go fails identically."""
+        bot, ctx = self._ctx(slash=False, send_fails=True)
+        await bot._report_failure(ctx)
+        ctx.channel.send.assert_not_awaited()
+
+    async def test_a_channel_that_also_refuses_is_survived(self):
+        bot, ctx = self._ctx(slash=True, send_fails=True)
+        response = MagicMock(status=403, reason="Forbidden")
+        ctx.channel.send.side_effect = discord.Forbidden(response, "no")
+        await bot._report_failure(ctx)  # must not raise
+
+
+class TestSlashCommandSync(unittest.IsolatedAsyncioTestCase):
+    """Publishing the slash commands.
+
+    A global sync reaches every server but Discord can take an hour to roll it
+    out, during which a command that was just added simply is not there.
+    SYNC_GUILD_ID is the shortcut, and it must never be able to cost everyone
+    else their commands.
+    """
+
+    def setUp(self):
+        import app
+
+        self.app = app
+        self.tree = app.bot.tree
+
+    async def _run(self, guild_id, sync=None):
+        sync = sync or AsyncMock(return_value=[])
+        copy = MagicMock()
+        with patch.object(self.tree, "sync", sync), patch.object(
+            self.tree, "copy_global_to", copy
+        ), patch.object(self.app, "SYNC_GUILD_ID", guild_id):
+            await self.app.bot._sync_commands()
+        return sync, copy
+
+    async def test_without_a_guild_id_only_the_global_sync_runs(self):
+        sync, copy = await self._run(0)
+        copy.assert_not_called()
+        sync.assert_awaited_once_with()
+
+    async def test_a_guild_id_publishes_there_as_well_as_globally(self):
+        sync, copy = await self._run(123)
+        copy.assert_called_once()
+        self.assertEqual(copy.call_args.kwargs["guild"].id, 123)
+        self.assertEqual(len(sync.await_args_list), 2)
+        self.assertEqual(sync.await_args_list[0].kwargs["guild"].id, 123)
+        # The global sync takes no guild at all.
+        self.assertEqual(sync.await_args_list[1].kwargs, {})
+
+    async def test_the_guild_sync_happens_first(self):
+        """It is the one the person restarting the bot is waiting on."""
+        sync, _copy = await self._run(123)
+        self.assertIsNotNone(sync.await_args_list[0].kwargs.get("guild"))
+
+    async def test_a_bad_guild_id_does_not_stop_the_global_sync(self):
+        """One wrong id in .env must not leave every server without commands."""
+        seen = []
+
+        async def flaky(*, guild=None):
+            seen.append(guild)
+            if guild is not None:
+                raise discord.HTTPException(
+                    MagicMock(status=403, reason="Forbidden"), "not in that guild"
+                )
+            return []
+
+        await self._run(999, sync=flaky)
+        self.assertEqual([g.id if g else None for g in seen], [999, None])

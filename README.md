@@ -1,8 +1,8 @@
 # Discord Bot Music Player
 
 A Discord music bot that streams audio from YouTube into a voice channel. Supports
-single videos and full playlists, a paged queue, volume control, and both prefix
-(`?play`) and slash (`/play`) commands.
+single videos and full playlists, a paged queue, saved playlists shared by the
+server, volume control, and both prefix (`?play`) and slash (`/play`) commands.
 
 Built on [discord.py](https://github.com/Rapptz/discord.py), [yt-dlp](https://github.com/yt-dlp/yt-dlp)
 and ffmpeg.
@@ -17,6 +17,7 @@ and ffmpeg.
 - [Configuration](#configuration)
 - [Running the bot](#running-the-bot)
 - [Commands](#commands)
+- [Saved playlists](#saved-playlists)
 - [How the code works](#how-the-code-works)
 - [Tests](#tests)
 - [Troubleshooting](#troubleshooting)
@@ -132,6 +133,8 @@ FFMPEG_PATH = C:\ffmpeg\bin\ffmpeg.exe
 |---|---|---|---|
 | `Bot-Token` | yes | - | Bot token from the Discord Developer Portal. |
 | `FFMPEG_PATH` | yes | - | ffmpeg executable, or the folder holding it. Blank falls back to `ffmpeg/` in the repo, then `PATH`. A path that does not exist raises at startup rather than silently using a different build. |
+| `SYNC_GUILD_ID` | no | - | Your server's id. Slash commands are published globally, which Discord can take up to an hour to roll out — so a command you just added looks missing. Setting this publishes to that one server instantly as well. |
+| `PLAYLIST_DB` | no | `data/playlists.db` | SQLite file holding the saved playlists. It is the only copy — point it at something you back up. |
 
 
 > **Never commit `src/.env`.** It is gitignored. If a token is ever pushed, treat it
@@ -157,8 +160,14 @@ INFO  music_bot: cogs registered and command tree synced
 INFO  music_bot: YourBot#1234 online
 ```
 
-Slash commands are synced globally on startup and can take a few minutes to appear
-in Discord the first time.
+Every command works as both `?add` and `/add` — they are the same command, declared
+once as a discord.py *hybrid*.
+
+Slash commands are synced globally on startup, which Discord can take up to an hour
+to roll out; until it does, a newly added command appears to be missing. Set
+`SYNC_GUILD_ID` to your own server's id and it is published there immediately as
+well. A bad id there is logged and skipped rather than aborting the global sync, so
+one typo cannot leave every server without commands.
 
 ### Typical session
 
@@ -187,6 +196,14 @@ Every command works as both a prefix command (`?add`) and a slash command (`/add
 | `?queue` | | Show the first page of the queue |
 | `?queueto` | page number | Show a specific queue page (10 songs per page) |
 | `?clear` | | Clear the queue, keeping whatever is currently playing |
+| `?playlist` | | The server's playlists, with a picker that plays one |
+| `?playlist create` | name | Start a new, empty playlist |
+| `?playlist add` | name, YouTube URL | Add a video or a whole playlist to it |
+| `?playlist show` | name | List what is in it, 10 songs per page |
+| `?playlist remove` | name, number | Take one song out |
+| `?playlist play` | name | Replace the queue with it and start playing |
+| `?playlist queue` | name | Add it to the end of the queue instead |
+| `?playlist rename` / `delete` | name | Its creator, or **Manage Server**, only |
 | `?volume` | 0–100 | Set playback volume (default 10%) |
 | `?stop` | | Stop, leave the voice channel and clear the queue |
 | `?help` | | Show the command manual |
@@ -220,30 +237,161 @@ consuming the channel's shared message budget.
 
 ---
 
+## Saved playlists
+
+A playlist belongs to the **server it was created in**. Everyone in that server can
+see it, add songs, remove songs, and play it; nobody outside can reach it at all, and
+it survives a restart. The queue is the other per-guild thing, but it is live,
+unnamed, and empty again when the process stops.
+
+```
+?playlist create Friday Night
+?playlist add "Friday Night" https://www.youtube.com/playlist?list=<id>
+?playlist play Friday Night
+```
+
+| | Songs (`add`, `remove`) | The list itself (`rename`, `delete`) |
+|---|---|---|
+| Anyone in the server | yes | no |
+| Whoever created it | yes | yes |
+| **Manage Server** | yes | yes |
+
+Names are matched case-insensitively but shown exactly as typed, so
+`?playlist play friday night` finds `Friday Night`. With the prefix form, a name with
+spaces needs quotes on the two-argument commands (`add`, `remove`, `rename`) because
+another argument follows it. The slash commands autocomplete the server's playlist
+names and never need quoting.
+
+Loading a playlist **copies** it into the queue. Skipping songs, clearing the queue,
+or stopping the bot cannot change the playlist itself. `?playlist play` replaces
+whatever was queued; `?playlist queue` leaves it alone and appends.
+
+### Why deleting is gated but editing is not
+
+A shared playlist anyone can delete is a griefing vector in a public server, and one
+only a moderator can touch is not really shared. Splitting the two — songs open to
+everyone, the list itself kept to whoever started it — is what makes it usable where
+not everybody is trusted equally. The refusal message says so explicitly, or it reads
+as though the playlists are not shared at all.
+
+`created_by` is stored with the playlist for exactly this reason: "whoever started
+this list" has to survive a restart along with it. A playlist with no recorded
+creator — hand-edited, or migrated from an older schema — is moderators-only.
+
+Limits: 25 playlists per server (also Discord's ceiling on the options in one
+dropdown, which is what the picker is), 10,000 songs per playlist — enough for two
+full YouTube playlists, which cap at 5,000 videos each. Adding a longer one takes
+what it can and says how many did not fit.
+
+### Storage
+
+One SQLite file — `data/playlists.db` by default, overridable with `PLAYLIST_DB`.
+`sqlite3` is in the standard library, so this adds no dependency.
+
+```sql
+playlists(id, guild_id, name, name_key, created_at, updated_at, created_by)
+         UNIQUE (guild_id, name_key)
+tracks   (playlist_id → playlists.id ON DELETE CASCADE, position, url, title, duration)
+         PRIMARY KEY (playlist_id, position)
+```
+
+**Why not a JSON file.** It was one, and that was right while a playlist held 500
+songs. Raising the cap to 10,000 changed the shape of the problem: a JSON document
+is rewritten *in full* on every change, so adding one song to a server holding
+250,000 meant serialising 43 MB and blocking the event loop for ~230 ms. The cost
+tracked the size of everything instead of the size of the edit.
+
+Measured on a full server (240,000 songs):
+
+| operation | JSON | SQLite |
+|---|---|---|
+| add one song | ~230 ms | **0.5 ms** |
+| autocomplete (per keystroke) | ~0 ms (in memory) | **0.13 ms** |
+| play one playlist | ~0 ms (in memory) | 7.6 ms |
+| `?playlist` listing | ~0 ms (in memory) | 79 ms |
+
+The trade is explicit: writes stopped scaling with total data, and reads now cost a
+query instead of a dict lookup. Two reads earn their own query rather than going
+through the general one:
+
+- **`names()`** for autocomplete, which fires on every keystroke and shows nothing
+  but names. Reading the songs to render a name list took 239 ms per keypress on a
+  full server; this takes 0.13 ms.
+- **`summaries()`** for the listing and the picker, which show a name and two totals
+  per row. A `GROUP BY` gets those in 79 ms where materialising every track took 228.
+  Songs are read only for the playlist actually opened.
+
+That leaves the listing proportional to the tracks table, because counting rows means
+visiting them. Carrying denormalised totals on the `playlists` row would make it
+constant, at the price of an invariant maintained by hand — not worth it for a
+command a person runs occasionally and Discord's own latency hides.
+
+Two things come along with the schema, and they are half the reason to switch:
+
+- **The invariants are the database's job.** `UNIQUE (guild_id, name_key)` is what
+  stops one server having two playlists whose names differ only in case; it used to
+  be a Python check that was only as good as the code around it. `ON DELETE CASCADE`
+  is what stops a deleted playlist leaving its songs behind.
+- **A change commits or it does not.** There is no "live in memory but not on disk"
+  state to report, because a failed transaction rolls back — which is why the failure
+  message can say *nothing was changed* and mean it.
+
+`sqlite3` blocks, so every library method is a coroutine running its SQL on a worker
+thread under a lock. The lock is also what makes one shared connection safe and each
+call atomic against the rest of the bot. WAL mode replaces the temp-file-fsync-rename
+dance the JSON store needed for crash safety.
+
+### Upgrading from the JSON store
+
+Nothing to do. On startup, a `playlists.json` next to the database is imported once
+and renamed to `playlists.imported-<timestamp>.json` — kept, not deleted, because it
+is the only copy of that data. All three JSON schemas the file store ever used are
+read; playlists that belonged to a *person* rather than a server (versions 1 and 2)
+have no server to move to and are reported rather than silently dropped.
+
+The import is skipped if the database already holds playlists, so a stale JSON file
+reappearing later cannot merge itself back in.
+
 ## How the code works
 
 ### Layout
 
 ```
 src/
-  app.py                    entrypoint: logging, config, cog registration
-  help.txt                  text shown by ?help
+  app.py                  entrypoint: logging, config, cog registration
+  help.txt                text shown by ?help
   music_player/
-    config.py               constants, tunables, ffmpeg discovery
-    logs.py                 dated log files, context, redaction
-    state.py                Track, GuildState, MusicState
-    ytdl.py                 YouTube metadata + stream resolution
-    ui.py                   embed builders, formatting, typing indicator
-    controls.py             buttons under Now Playing and the queue
-    player.py               Player cog: queue and playback commands
-    join_channel.py         JoinChannel cog
-    leave_channel.py        LeaveChannel cog
+    config.py             constants, tunables, ffmpeg discovery
+    logs.py               dated log files, context, redaction
+    state.py              Track, GuildState, MusicState
+    audio.py              buffered audio source
+
+    services/             everything outside Discord
+      youtube.py          metadata and stream resolution (yt-dlp)
+      library.py          saved playlists: schema and SQLite persistence
+
+    ui/                   everything the user sees
+      embeds.py           embed builders, formatting, typing indicator
+      views.py            buttons and menus under those embeds
+      manual.py           the ?help manual, parsed from help.txt
+
+    cogs/                 the command surface, one per area
+      player.py           queue and playback commands
+      playlists.py        ?playlist and its subcommands
+      voice.py            joining and leaving a voice channel
 tests/
-  test_music_player.py      264 unit tests
-logs/                       written at runtime, gitignored
-  2026/08/09/bot.log        everything, that day
-  2026/08/09/errors.log     warnings and errors only
+  test_music_player.py    unit tests
+data/                     written at runtime, gitignored
+  playlists.db            every server's saved playlists (SQLite)
+logs/                     written at runtime, gitignored
+  2026/08/09/bot.log      everything, that day
+  2026/08/09/errors.log   warnings and errors only
 ```
+
+Dependencies point one way: `cogs` may use `ui` and `services`, `ui` may use
+`services`, and `services` depends on nothing but `config`. The only imports
+that run the other way are `TYPE_CHECKING`-only annotations in `ui/views.py`,
+so nothing is circular at runtime.
 
 ### State
 
@@ -253,6 +401,11 @@ those, keyed by guild id, and is constructed once in `app.py` and injected into 
 cog — so the cogs share state without reaching for globals.
 
 Guilds are fully independent. Nothing one server does blocks another.
+
+Saved playlists are per-guild too, but they outlive the process. `PlaylistLibrary`
+(`library.py`) is keyed by guild id, is constructed once in `app.py` alongside
+`MusicState`, and is the only thing in the bot that touches the disk during normal
+operation.
 
 ### Playback flow
 
@@ -272,7 +425,7 @@ the handover between songs is instant rather than a 1–2s pause.
 
 `yt_dlp` is synchronous and does network I/O. Calling it directly inside an `async`
 handler would freeze the entire bot — every guild, every command — for the duration.
-Instead `ytdl.py` runs every extraction on a dedicated thread pool, so command
+Instead `services/youtube.py` runs every extraction on a dedicated thread pool, so command
 handling continues while lookups are in flight.
 
 Using the `yt_dlp` Python API (rather than shelling out to the `yt-dlp` binary) also
@@ -301,7 +454,7 @@ though everything else is parallel:
 ### Autocomplete
 
 `?add` suggests the video or playlist title as you type. Discord discards an
-autocomplete response after 3 seconds, so `ytdl.py`:
+autocomplete response after 3 seconds, so `services/youtube.py`:
 
 1. rejects half-typed input offline (a YouTube id is always 11 characters) — no
    network call at all;
@@ -317,10 +470,12 @@ autocomplete response after 3 seconds, so `ytdl.py`:
 python -m unittest discover -s tests -v
 ```
 
-264 tests covering URL normalisation, duration formatting, queue pagination, state
+409 tests covering URL normalisation, duration formatting, queue pagination, state
 transitions, autocomplete gating, caching and request coalescing, embed rendering,
-button permissions and paging, log rotation and redaction, and the concurrency
-safeguards above. They use test doubles and need no Discord token.
+button permissions and paging, the playlist schema's own constraints, importing the
+old JSON store, per-server isolation and playlist permissions, command syncing, log
+rotation and redaction, and the concurrency safeguards above. They use test doubles
+and need no Discord token.
 
 The suite does **not** cover live voice playback — that requires a real Discord
 connection and should be smoke-tested manually.

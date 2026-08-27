@@ -29,6 +29,12 @@ class Track:
     duration: int
     requester_id: int
     requester_name: str
+    #: The playlist this song arrived with, if it came in as part of one -
+    #: a saved playlist, or the YouTube playlist behind an ``?add`` link.
+    #: Snapshotted as a name rather than a reference, for the same reason
+    #: ``requester_name`` is: it records what was true when the song was
+    #: queued, and stays true if the playlist is later renamed or deleted.
+    source: Optional[str] = None
 
 
 class GuildState:
